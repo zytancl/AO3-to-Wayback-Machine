@@ -29,6 +29,7 @@
 // @match        http://insecure.archiveofourown.org/collections/*/works/*
 // @connect      web.archive.org
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
@@ -102,7 +103,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '1.7',
+            version: '2.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -366,50 +367,132 @@
     // ARCHIVING
     // ================================================================
 
-    function saveToWayback(url) {
-        return new Promise(function (resolve, reject) {
-            // Use POST with the target URL form-encoded in the request body.
-            //
-            // A GET request to /save/{url} passes the full URL string to
-            // GM_xmlhttpRequest's HTTP layer, which splits it at the first '?'
-            // and sends ?view_adult=true&view_full_work=true as query params for
-            // web.archive.org itself rather than as part of the AO3 URL. This
-            // causes Wayback to archive the wrong URL regardless of %3F encoding.
-            //
-            // POST avoids this entirely: the target URL is encodeURIComponent'd
-            // into the request body, which is never parsed as a URL by the HTTP
-            // layer. Wayback decodes it server-side and archives the correct URL.
-            console.log('[AO3→Wayback] Sending to Wayback Machine:', url);
+    // Pre-check whether an AO3 URL is publicly accessible without login.
+    // Uses anonymous: true to strip session cookies from the HEAD request,
+    // simulating what Wayback's unauthenticated crawler would see.
+    // Returns a Promise<boolean> — true means Wayback should be able to
+    // access the page; false means it is likely login-restricted.
+    function checkAo3Accessible(url) {
+        return new Promise(function (resolve) {
             GM_xmlhttpRequest({
-                method: 'POST',
-                url: 'https://web.archive.org/save',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
+                method: 'HEAD',
+                url: url.split('?')[0],  // check base URL, no view params
+                anonymous: true,         // strip cookies — simulate Wayback
+                timeout: 10000,
+                onload: function (r) {
+                    console.log('[AO3→Wayback] AO3 accessibility check:', r.status, 'for', url);
+                    // AO3 returns 404 (not 403) for login-required content
+                    // when accessed without a valid session.
+                    resolve(r.status !== 404);
                 },
-                data: 'url=' + encodeURIComponent(url),
-                // Treat redirects as success — Wayback returns 302 → archived URL.
-                onload: function (response) {
-                    console.log('[AO3→Wayback] Response status for', url, ':', response.status);
-                    // 200 = saved, 302 = redirect to snapshot (also success).
-                    // Treat anything < 400 as success.
-                    if (response.status < 400) {
-                        resolve(url);
-                    } else {
-                        var msg = 'HTTP ' + response.status + ' saving ' + url;
-                        logError('saveToWayback:onload', msg);
-                        reject(new Error(msg));
+                // On network error or timeout, assume accessible so we still
+                // attempt the archive rather than silently skipping.
+                onerror: function () { resolve(true); },
+                ontimeout: function () { resolve(true); },
+            });
+        });
+    }
+
+    // Check the Wayback CDX API to see whether a snapshot of a URL was
+    // created today. Returns a Promise<boolean>.
+    // The target URL is passed as a query param value (encodeURIComponent),
+    // so there is no URL-in-path encoding problem.
+    function checkCdx(url) {
+        return new Promise(function (resolve) {
+            var today = new Date();
+            var yyyymmdd = String(today.getFullYear()) +
+                String(today.getMonth() + 1).padStart(2, '0') +
+                String(today.getDate()).padStart(2, '0');
+
+            // matchType=prefix matches any query-param variant Wayback stored.
+            var cdxUrl = 'https://web.archive.org/cdx/search/cdx' +
+                '?output=json&limit=1&fl=timestamp&matchType=prefix' +
+                '&from=' + yyyymmdd +
+                '&url=' + encodeURIComponent(url.split('?')[0]);
+
+            console.log('[AO3→Wayback] CDX check:', cdxUrl);
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: cdxUrl,
+                timeout: 15000,
+                onload: function (r) {
+                    try {
+                        var rows = JSON.parse(r.responseText || '[]');
+                        var found = Array.isArray(rows) && rows.length > 1;
+                        console.log('[AO3→Wayback] CDX found:', found, 'for', url);
+                        resolve(found);
+                    } catch (_) {
+                        resolve(false);
                     }
                 },
-                onerror: function (err) {
-                    var msg = 'Network error saving ' + url + ': ' + (err.statusText || 'unknown');
-                    logError('saveToWayback:onerror', msg);
-                    reject(new Error(msg));
-                },
-                ontimeout: function () {
-                    var msg = 'Timed out saving ' + url;
-                    logError('saveToWayback:ontimeout', msg);
-                    reject(new Error(msg));
-                },
+                onerror: function () { resolve(false); },
+                ontimeout: function () { resolve(false); },
+            });
+        });
+    }
+
+    // Archive a single URL.
+    //
+    // Step 1 — pre-check (anonymous HEAD to AO3):
+    //   Simulate what Wayback's crawler sees. If AO3 returns 404 without
+    //   cookies, Wayback would get the same result, so we reject immediately
+    //   with a clear "restricted" message rather than wasting a save attempt.
+    //
+    // Step 2 — save (GM_openInTab):
+    //   Opens https://web.archive.org/save/{encoded-url} in a background tab.
+    //   Real browser navigation bypasses all extension HTTP sandboxing; %3F
+    //   is preserved as a path character so the full AO3 URL including view
+    //   params reaches Wayback correctly. Tab auto-closes after 30 s.
+    //
+    // Step 3 — verify (Wayback CDX):
+    //   Checks after 35 s whether a snapshot from today appears in CDX.
+    //   Resolves with { url } on success, rejects with Error on failure.
+    var CDX_CHECK_DELAY_MS = 35000;
+    var TAB_CLOSE_DELAY_MS = 30000;
+
+    function saveToWayback(url) {
+        return new Promise(function (resolve, reject) {
+            checkAo3Accessible(url).then(function (accessible) {
+                if (!accessible) {
+                    var restrictedMsg = 'Skipped ' + url +
+                        ' — AO3 returned 404 without login.' +
+                        ' This work is restricted to registered users;' +
+                        ' Wayback Machine cannot access it.';
+                    logError('saveToWayback:restricted', restrictedMsg);
+                    reject(new Error(restrictedMsg));
+                    return;
+                }
+
+                var saveUrl = 'https://web.archive.org/save/' +
+                    url.replace('?', '%3F').replace(/&/g, '%26');
+
+                console.log('[AO3→Wayback] Opening save tab:', saveUrl);
+                var tab;
+                try {
+                    tab = GM_openInTab(saveUrl, { active: false, insert: false });
+                } catch (e) {
+                    var openErr = 'GM_openInTab failed for ' + url + ': ' + String(e);
+                    logError('saveToWayback:open', openErr);
+                    reject(new Error(openErr));
+                    return;
+                }
+
+                setTimeout(function () {
+                    try { tab.close(); } catch (_) {}
+                }, TAB_CLOSE_DELAY_MS);
+
+                setTimeout(function () {
+                    checkCdx(url).then(function (found) {
+                        if (found) {
+                            resolve({ url: url });
+                        } else {
+                            var missMsg = 'No CDX snapshot found for ' + url +
+                                ' — the save may have failed or is still processing.';
+                            logError('saveToWayback:cdx-miss', missMsg);
+                            reject(new Error(missMsg));
+                        }
+                    });
+                }, CDX_CHECK_DELAY_MS);
             });
         });
     }
@@ -428,17 +511,29 @@
         showBanner('⏳ Sending ' + count + ' ' + noun + ' to the Wayback Machine…', 'info', 30000);
         console.log('[AO3→Wayback] Starting archive of', count, noun);
 
+        // Show an immediate "sending" notice so the user knows something
+        // is happening. The result banner replaces it after ~50 seconds
+        // once the CDX verification completes.
+        showBanner('⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine… (verifying in ~50s)', 'info', 55000);
+
         Promise.allSettled(urlArray.map(saveToWayback)).then(function (results) {
             var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
             var fail = results.filter(function (r) { return r.status === 'rejected'; });
 
             if (fail.length === 0) {
                 showBanner('✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.', 'success');
-                console.log('[AO3→Wayback] All done.');
             } else if (ok.length === 0) {
-                showBanner('❌ Failed to archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.', 'error', 10000);
+                showBanner(
+                    '❌ Could not verify archive for ' + count + ' ' + noun +
+                    '. Work may require AO3 login. Open ⚙ → Copy error log.',
+                    'error', 12000
+                );
             } else {
-                showBanner('⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' + fail.length + ' failed. Open ⚙ → Copy error log.', 'error', 10000);
+                showBanner(
+                    '⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' +
+                    fail.length + ' unverified. Open ⚙ → Copy error log.',
+                    'error', 10000
+                );
             }
         });
     }

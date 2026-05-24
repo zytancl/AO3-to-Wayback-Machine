@@ -102,7 +102,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '1.6',
+            version: '1.7',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -368,24 +368,28 @@
 
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
-            // The Wayback /save/ endpoint expects the target as a path segment:
-            //   /save/https://example.com/page?foo=bar
-            // When GM_xmlhttpRequest parses the full URL it splits at '?' and
-            // sends view_adult=true&view_full_work=true as query params for
-            // web.archive.org itself, so Wayback archives the wrong (param-less)
-            // URL. Encoding only '?' -> '%3F' and '&' -> '%26' in the target
-            // keeps the entire AO3 URL as one path segment; Wayback decodes
-            // %3F/%26 correctly when resolving the target URL internally.
-            var saveUrl = 'https://web.archive.org/save/' +
-                url.replace('?', '%3F').replace(/&/g, '%26');
-
-            console.log('[AO3→Wayback] Sending to Wayback Machine:', saveUrl);
+            // Use POST with the target URL form-encoded in the request body.
+            //
+            // A GET request to /save/{url} passes the full URL string to
+            // GM_xmlhttpRequest's HTTP layer, which splits it at the first '?'
+            // and sends ?view_adult=true&view_full_work=true as query params for
+            // web.archive.org itself rather than as part of the AO3 URL. This
+            // causes Wayback to archive the wrong URL regardless of %3F encoding.
+            //
+            // POST avoids this entirely: the target URL is encodeURIComponent'd
+            // into the request body, which is never parsed as a URL by the HTTP
+            // layer. Wayback decodes it server-side and archives the correct URL.
+            console.log('[AO3→Wayback] Sending to Wayback Machine:', url);
             GM_xmlhttpRequest({
-                method: 'GET',
-                url: saveUrl,
+                method: 'POST',
+                url: 'https://web.archive.org/save',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                data: 'url=' + encodeURIComponent(url),
                 // Treat redirects as success — Wayback returns 302 → archived URL.
                 onload: function (response) {
-                    console.log('[AO3→Wayback] Response status for', saveUrl, ':', response.status);
+                    console.log('[AO3→Wayback] Response status for', url, ':', response.status);
                     // 200 = saved, 302 = redirect to snapshot (also success).
                     // Treat anything < 400 as success.
                     if (response.status < 400) {

@@ -102,7 +102,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '1.5',
+            version: '1.6',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -368,17 +368,24 @@
 
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
-            console.log('[AO3→Wayback] Sending to Wayback Machine:', url);
+            // The Wayback /save/ endpoint expects the target as a path segment:
+            //   /save/https://example.com/page?foo=bar
+            // When GM_xmlhttpRequest parses the full URL it splits at '?' and
+            // sends view_adult=true&view_full_work=true as query params for
+            // web.archive.org itself, so Wayback archives the wrong (param-less)
+            // URL. Encoding only '?' -> '%3F' and '&' -> '%26' in the target
+            // keeps the entire AO3 URL as one path segment; Wayback decodes
+            // %3F/%26 correctly when resolving the target URL internally.
+            var saveUrl = 'https://web.archive.org/save/' +
+                url.replace('?', '%3F').replace(/&/g, '%26');
+
+            console.log('[AO3→Wayback] Sending to Wayback Machine:', saveUrl);
             GM_xmlhttpRequest({
                 method: 'GET',
-                // Pass the raw URL — GM_xmlhttpRequest sends it verbatim.
-                // The Wayback Machine /save/ endpoint expects a plain URL.
-                // Do NOT encodeURIComponent here: that would turn ? into %3F
-                // and the save request would fail or archive the wrong URL.
-                url: 'https://web.archive.org/save/' + url,
+                url: saveUrl,
                 // Treat redirects as success — Wayback returns 302 → archived URL.
                 onload: function (response) {
-                    console.log('[AO3→Wayback] Response status for', url, ':', response.status);
+                    console.log('[AO3→Wayback] Response status for', saveUrl, ':', response.status);
                     // 200 = saved, 302 = redirect to snapshot (also success).
                     // Treat anything < 400 as success.
                     if (response.status < 400) {

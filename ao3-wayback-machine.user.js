@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
-// @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date.
-// @version      1.3
+// @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
+// @version      1.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -39,8 +39,24 @@
     'use strict';
 
     // ================================================================
-    // SETTINGS — stored with GM_getValue/GM_setValue.
-    // Edit via the ⚙ button at the bottom-right of any AO3 page.
+    // Promise.allSettled polyfill
+    // Needed for older Tampermonkey engines (Safari, older Chrome).
+    // ================================================================
+    if (typeof Promise.allSettled !== 'function') {
+        Promise.allSettled = function (promises) {
+            return Promise.all(promises.map(function (p) {
+                return Promise.resolve(p).then(
+                    function (value) { return { status: 'fulfilled', value: value }; },
+                    function (reason) { return { status: 'rejected', reason: reason }; }
+                );
+            }));
+        };
+    }
+
+
+    // ================================================================
+    // SETTINGS — persisted with GM_getValue / GM_setValue.
+    // Edit via the ⚙ button injected at the bottom-right of the page.
     // ================================================================
 
     var SETTINGS_KEY = 'ao3wayback_settings';
@@ -86,13 +102,12 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '1.3',
+            version: '1.4',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
         }, null, 2);
 
-        // Copy to clipboard (works in all modern browsers including Safari).
         if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text).then(function () {
                 showBanner('📋 Error log copied to clipboard.', 'info');
@@ -104,7 +119,6 @@
         }
     }
 
-    // Textarea-based clipboard fallback for older browsers or restricted contexts.
     function fallbackCopyLog(text) {
         var ta = document.createElement('textarea');
         ta.value = text;
@@ -116,7 +130,7 @@
             document.execCommand('copy');
             showBanner('📋 Error log copied to clipboard.', 'info');
         } catch (_) {
-            showBanner('❌ Could not copy log. Check the browser console.', 'error');
+            showBanner('❌ Could not copy log — check the browser console.', 'error');
         }
         document.body.removeChild(ta);
     }
@@ -135,8 +149,6 @@
         'insecure.archiveofourown.org',
     ];
 
-    // Normalise any official mirror domain to archiveofourown.org so the
-    // canonical URL is always what gets sent to the Wayback Machine.
     function canonicaliseHost(url) {
         try {
             var parsed = new URL(url);
@@ -151,14 +163,13 @@
         }
     }
 
-    // Build a Wayback wildcard link href for an AO3 URL.
+    // Build a Wayback wildcard href for an AO3 URL.
     //
-    // The Wayback Machine stores URLs with literal ? and & in the path, so
-    // using %3F/%26 causes the calendar to return zero results. Instead:
-    //   - keep ? as-is (safe in an href path)
-    //   - encode & as &amp; (correct HTML attribute escaping — the browser
-    //     decodes &amp; to & before following the link, so Wayback receives
-    //     the canonical URL it has on record)
+    // Wayback indexes URLs with a literal ? in the path. Encoding it as %3F
+    // causes the calendar to return zero results, so we keep ? as-is.
+    // & must be HTML-encoded as &amp; so the browser does not treat it as
+    // a separator between query parameters for web.archive.org itself —
+    // the browser decodes &amp; back to & before following the link.
     function waybackHref(url) {
         return 'https://web.archive.org/web/*/' + url.replace(/&/g, '&amp;');
     }
@@ -178,9 +189,9 @@
     // ================================================================
     // PAGE DATA COLLECTION
     // Returns { isSeries, series, works, urls }
-    //   series — { title, author, url } | null
+    //   series — { title, author, url } or null
     //   works  — [{ title, author, url }]
-    //   urls   — Set of canonical URLs to archive
+    //   urls   — Set of canonical AO3 URLs to archive
     // ================================================================
 
     function collectPageData() {
@@ -191,9 +202,6 @@
         var urls = new Set();
 
         if (isSeries) {
-            // --- Series page ---
-
-            // Series title and author.
             var h2 = document.querySelector('h2.heading');
             var seriesTitle = h2 ? h2.textContent.trim() : document.title;
             var seriesAuthorEl = document.querySelector('.series.meta.group dd');
@@ -203,7 +211,6 @@
             series = { title: seriesTitle, author: seriesAuthor, url: seriesUrl };
             urls.add(seriesUrl);
 
-            // Individual works listed in the series blurbs.
             document.querySelectorAll('.work.blurb.group').forEach(function (blurb) {
                 var workLink = blurb.querySelector('h4.heading a[href*="/works/"]');
                 if (!workLink) workLink = blurb.querySelector('a[href*="/works/"]');
@@ -212,7 +219,6 @@
                 var authorLink = blurb.querySelector('[rel="author"]');
                 var workTitle = workLink.textContent.trim();
                 var workAuthor = authorLink ? authorLink.textContent.trim() : '';
-
                 var rawPath = workLink.getAttribute('href').split('?')[0].replace(/\/chapters\/\d+/, '');
                 var workUrl = canonicaliseHost(
                     new URL(rawPath, window.location.origin).toString()
@@ -223,8 +229,6 @@
             });
 
         } else {
-            // --- Single work page ---
-
             var titleEl = document.querySelector('h2.title.heading');
             var workTitle = titleEl ? titleEl.textContent.trim() : document.title;
 
@@ -257,12 +261,10 @@
         var lines = [];
 
         if (pageData.isSeries && pageData.series) {
-            // Series line.
             lines.push(
                 '<a href="' + waybackHref(pageData.series.url) + '">' +
                 pageData.series.title + '</a> by ' + pageData.series.author
             );
-            // One line per work in the series.
             pageData.works.forEach(function (w) {
                 lines.push(
                     '<a href="' + waybackHref(w.url) + '">' +
@@ -281,8 +283,6 @@
 
         var noteSnippet = lines.join('<br>');
 
-        // Preserve any personal notes above the auto-generated section.
-        // On re-edits, only the last line (the date) is refreshed.
         var existing = field.value || '';
         var divIdx = existing.indexOf(settings.noteDivider);
         var userNotes = divIdx !== -1
@@ -353,29 +353,35 @@
 
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
+            console.log('[AO3→Wayback] Sending to Wayback Machine:', url);
             GM_xmlhttpRequest({
                 method: 'GET',
-                // Pass the URL as-is — GM_xmlhttpRequest sends it verbatim and
-                // the Wayback Machine /save/ endpoint expects a plain URL, not
-                // a percent-encoded one.
+                // Pass the raw URL — GM_xmlhttpRequest sends it verbatim.
+                // The Wayback Machine /save/ endpoint expects a plain URL.
+                // Do NOT encodeURIComponent here: that would turn ? into %3F
+                // and the save request would fail or archive the wrong URL.
                 url: 'https://web.archive.org/save/' + url,
+                // Treat redirects as success — Wayback returns 302 → archived URL.
                 onload: function (response) {
+                    console.log('[AO3→Wayback] Response status for', url, ':', response.status);
+                    // 200 = saved, 302 = redirect to snapshot (also success).
+                    // Treat anything < 400 as success.
                     if (response.status < 400) {
                         resolve(url);
                     } else {
-                        var msg = 'HTTP ' + response.status + ' for ' + url;
-                        logError('saveToWayback', msg);
+                        var msg = 'HTTP ' + response.status + ' saving ' + url;
+                        logError('saveToWayback:onload', msg);
                         reject(new Error(msg));
                     }
                 },
                 onerror: function (err) {
-                    var msg = 'Network error for ' + url + ': ' + (err.statusText || 'unknown');
-                    logError('saveToWayback', msg);
+                    var msg = 'Network error saving ' + url + ': ' + (err.statusText || 'unknown');
+                    logError('saveToWayback:onerror', msg);
                     reject(new Error(msg));
                 },
                 ontimeout: function () {
-                    var msg = 'Timed out for ' + url;
-                    logError('saveToWayback', msg);
+                    var msg = 'Timed out saving ' + url;
+                    logError('saveToWayback:ontimeout', msg);
                     reject(new Error(msg));
                 },
             });
@@ -389,29 +395,33 @@
         _hasRun = true;
         setTimeout(function () { _hasRun = false; }, 5000);
 
-        var count = urls.size;
+        var urlArray = Array.from(urls);
+        var count = urlArray.length;
         var noun = count === 1 ? 'fic' : 'fics';
 
         showBanner('⏳ Sending ' + count + ' ' + noun + ' to the Wayback Machine…', 'info', 30000);
+        console.log('[AO3→Wayback] Starting archive of', count, noun);
 
-        Promise.allSettled(Array.from(urls).map(saveToWayback))
-            .then(function (results) {
-                var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
-                var fail = results.filter(function (r) { return r.status === 'rejected'; });
+        Promise.allSettled(urlArray.map(saveToWayback)).then(function (results) {
+            var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
+            var fail = results.filter(function (r) { return r.status === 'rejected'; });
 
-                if (fail.length === 0) {
-                    showBanner('✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.', 'success');
-                } else if (ok.length === 0) {
-                    showBanner('❌ Failed to archive ' + fail.length + ' ' + noun + '. Open ⚙ for the error log.', 'error', 10000);
-                } else {
-                    showBanner('⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' + fail.length + ' failed. Open ⚙ for the error log.', 'error', 10000);
-                }
-            });
+            if (fail.length === 0) {
+                showBanner('✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.', 'success');
+                console.log('[AO3→Wayback] All done.');
+            } else if (ok.length === 0) {
+                showBanner('❌ Failed to archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.', 'error', 10000);
+            } else {
+                showBanner('⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' + fail.length + ' failed. Open ⚙ → Copy error log.', 'error', 10000);
+            }
+        });
     }
 
 
     // ================================================================
     // SETTINGS UI
+    // A ⚙ button at the bottom-right opens a modal settings panel,
+    // styled to match AO3's default cream/red colour scheme.
     // ================================================================
 
     function injectSettingsUI(pageData) {
@@ -528,6 +538,8 @@
 
         // ---- Checkbox: archive plain URL --------------------------------
 
+        box.appendChild(sectionHead('Options'));
+
         var plainUrlCheck = document.createElement('input');
         plainUrlCheck.type = 'checkbox';
         plainUrlCheck.id = 'ao3wayback-plain-url';
@@ -542,9 +554,9 @@
             cursor: 'pointer',
         });
         plainUrlLabel.appendChild(plainUrlCheck);
-        var plainUrlText = document.createElement('span');
-        plainUrlText.textContent = 'Also archive URL without view params';
-        plainUrlLabel.appendChild(plainUrlText);
+        var plainUrlSpan = document.createElement('span');
+        plainUrlSpan.textContent = 'Also archive URL without view params';
+        plainUrlLabel.appendChild(plainUrlSpan);
         box.appendChild(plainUrlLabel);
 
 
@@ -601,16 +613,16 @@
             fontFamily: 'monospace',
             background: '#fff',
             color: '#2a2a2a',
+            marginTop: '4px',
         });
         box.appendChild(noteLabelInput);
 
 
-        // ---- Error log button -------------------------------------------
+        // ---- Error log --------------------------------------------------
 
         box.appendChild(sectionHead('Diagnostics'));
 
         var logBtn = document.createElement('button');
-        logBtn.textContent = '📋 Copy error log';
         Object.assign(logBtn.style, {
             padding: '6px 12px',
             borderRadius: '4px',
@@ -619,6 +631,7 @@
             border: '1px solid #aaa',
             background: '#f5f5f5',
             color: '#2a2a2a',
+            marginTop: '4px',
             marginBottom: '18px',
             width: '100%',
         });
@@ -669,8 +682,8 @@
                 dateFormatRadios[fmt].checked = settings.dateFormat === fmt;
             });
             noteLabelInput.value = settings.noteDivider;
-            // Update the log button label with current count.
-            logBtn.textContent = '📋 Copy error log (' + _errorLog.length + ' entr' + (_errorLog.length === 1 ? 'y' : 'ies') + ')';
+            logBtn.textContent = '📋 Copy error log (' + _errorLog.length + ' entr' +
+                (_errorLog.length === 1 ? 'y' : 'ies') + ')';
             overlay.style.display = 'flex';
         }
 
@@ -681,7 +694,6 @@
         gearBtn.addEventListener('click', openModal);
         closeBtn.addEventListener('click', closeModal);
         cancelActionBtn.addEventListener('click', closeModal);
-
         overlay.addEventListener('click', function (e) {
             if (e.target === overlay) closeModal();
         });
@@ -702,7 +714,6 @@
             closeModal();
             showBanner('✅ Settings saved.', 'success');
 
-            // Re-inject the note immediately with updated settings.
             if (document.getElementById('bookmark_notes')) {
                 injectBookmarkNote(pageData);
             }
@@ -716,8 +727,8 @@
 
     var pageData = collectPageData();
 
-    // Inject the bookmark note whenever the notes textarea appears.
-    // AO3 loads the bookmark form via AJAX, so a MutationObserver is needed.
+    // Inject the bookmark note whenever the textarea appears.
+    // AO3 loads the form via AJAX so a MutationObserver is required.
     function onNodeAdded(node) {
         if (node.nodeType !== Node.ELEMENT_NODE) return;
         var field = node.id === 'bookmark_notes'
@@ -737,7 +748,7 @@
         injectBookmarkNote(pageData);
     }
 
-    // Trigger archiving on bookmark form submission.
+    // Trigger archiving when the bookmark form is submitted.
     window.addEventListener('submit', function (e) {
         var form = e.target;
         if (!form || !form.action) return;

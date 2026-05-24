@@ -2,6 +2,8 @@
 
 A userscript that automatically saves AO3 fics to the [Internet Archive Wayback Machine](https://web.archive.org/) when you bookmark them, and fills your bookmark notes with a Wayback link, the fic's author, and the date you bookmarked it.
 
+Expect constant updates because the auto-archive function may randomly stop working.
+
 ## Features
 
 - **Auto-archives when bookmarking** - automatically sends the fic to the Wayback Machine everytime you submit a bookmark, no extra clicks needed
@@ -59,7 +61,7 @@ Click the ⚙ floating button at the bottom-right corner of any AO3 work, series
 |---|---|---|
 | Also archive URL without view params | `Off` | Also archives the base work URL in addition to the `?view_adult=true&view_full_work=true` version |
 | Date Format | `DD/MM/YYYY` | Format for the bookmark date. Options: `DD/MM/YYYY`, `MM/DD/YYYY`, `YYYY-MM-DD` |
-| Note label | `Last Bookmarked: ` | The label used to identify and update the date line in your bookmark notes |
+| Note label | `Last Bookmarked:` | The label used to identify and update the date line in your bookmark notes |
 
 Settings are saved persistently and apply immediately.
 
@@ -68,12 +70,12 @@ Settings are saved persistently and apply immediately.
 If archiving fails, the status banner will say so. To get a diagnostic report:
 
 - Click the ⚙ floating button at the bottom-right of the page
-- Click 📋 Copy error log (N entries)
+- Click "📋 Copy error log"
 - Paste the copied JSON into a new GitHub issue
 
 **Note: The above function may not work, so if there's no logs for you, just manually explain what happened.**
 
-Please also include your browser name and version, and which userscript manager you're using.
+When writing the issue, please read the template and its instructions properly.
 
 ## Notes
 

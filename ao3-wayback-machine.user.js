@@ -40,8 +40,8 @@
     'use strict';
 
     // ================================================================
-    // Promise.allSettled polyfill
-    // Needed for older Tampermonkey engines (Safari, older Chrome).
+    // promise.allSettled polyfill
+    // needed for older tampermonkey engines (safari, older chrome)
     // ================================================================
     if (typeof Promise.allSettled !== 'function') {
         Promise.allSettled = function (promises) {
@@ -56,8 +56,8 @@
 
 
     // ================================================================
-    // SETTINGS — persisted with GM_getValue / GM_setValue.
-    // Edit via the ⚙ button injected at the bottom-right of the page.
+    // settings — persisted with GM_getValue / GM_setValue.
+    // edit via the ⚙ button at the bottom-right of any ao3 page
     // ================================================================
 
     var SETTINGS_KEY = 'ao3wayback_settings';
@@ -66,6 +66,8 @@
         alsoArchivePlainUrl: false,
         dateFormat: 'DD/MM/YYYY',
         noteDivider: 'Last Bookmarked: ',
+        maxRetries: 2,
+        retryDelayMs: 20000,
     };
 
     function loadSettings() {
@@ -84,7 +86,7 @@
 
 
     // ================================================================
-    // ERROR LOG
+    // error log
     // ================================================================
 
     var _errorLog = [];
@@ -103,7 +105,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.0',
+            version: '2.2',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -138,7 +140,7 @@
 
 
     // ================================================================
-    // URL UTILITIES
+    // url utilities
     // ================================================================
 
     var MIRROR_DOMAINS = [
@@ -164,13 +166,12 @@
         }
     }
 
-    // Build a Wayback wildcard href for an AO3 URL.
-    //
-    // Wayback indexes URLs with a literal ? in the path. Encoding it as %3F
-    // causes the calendar to return zero results, so we keep ? as-is.
-    // & must be HTML-encoded as &amp; so the browser does not treat it as
-    // a separator between query parameters for web.archive.org itself —
-    // the browser decodes &amp; back to & before following the link.
+    // build a wayback wildcard href for an ao3 url.
+    // wayback indexes urls with a literal ? in the path — encoding it as
+    // %3F causes the calendar to return zero results, so i keep ? as-is.
+    // & needs to be html-encoded as &amp; so the browser doesn't treat it
+    // as a query param separator for web.archive.org — it decodes &amp;
+    // back to & before actually following the link
     function waybackHref(url) {
         return 'https://web.archive.org/web/*/' + url.replace(/&/g, '&amp;');
     }
@@ -188,11 +189,11 @@
 
 
     // ================================================================
-    // PAGE DATA COLLECTION
-    // Returns { isSeries, series, works, urls }
-    //   series — { title, author, url } or null
-    //   works  — [{ title, author, url }]
-    //   urls   — Set of canonical AO3 URLs to archive
+    // page data collection
+    // returns { isSeries, series, works, urls }
+    // series — { title, author, url } or null
+    // works  — [{ title, author, url }]
+    // urls   — set of canonical ao3 urls to archive
     // ================================================================
 
     function collectPageData() {
@@ -251,7 +252,7 @@
 
 
     // ================================================================
-    // BOOKMARK NOTE INJECTION
+    // bookmark note injection
     // ================================================================
 
     function injectBookmarkNote(pageData) {
@@ -286,10 +287,10 @@
 
         var existing = field.value || '';
 
-        // Find the start of the entire auto-generated block.
-        // We check for both the Wayback link (title line) and the date label
-        // and use whichever appears first, so the whole block is replaced on
-        // re-edits rather than only the date line being updated.
+        // find the start of the entire auto-generated block.
+        // i check for both the wayback link and the date label and use
+        // whichever comes first, so the whole block gets replaced on
+        // re-edits rather than just the date line
         var waybackIdx = existing.indexOf('<a href="https://web.archive.org/web/*/');
         var divIdx = existing.indexOf(settings.noteDivider);
         var autoStart = -1;
@@ -310,7 +311,7 @@
 
 
     // ================================================================
-    // STATUS BANNER
+    // status banner
     // ================================================================
 
     function getOrCreateBanner() {
@@ -364,39 +365,12 @@
 
 
     // ================================================================
-    // ARCHIVING
+    // archiving
     // ================================================================
 
-    // Pre-check whether an AO3 URL is publicly accessible without login.
-    // Uses anonymous: true to strip session cookies from the HEAD request,
-    // simulating what Wayback's unauthenticated crawler would see.
-    // Returns a Promise<boolean> — true means Wayback should be able to
-    // access the page; false means it is likely login-restricted.
-    function checkAo3Accessible(url) {
-        return new Promise(function (resolve) {
-            GM_xmlhttpRequest({
-                method: 'HEAD',
-                url: url.split('?')[0],  // check base URL, no view params
-                anonymous: true,         // strip cookies — simulate Wayback
-                timeout: 10000,
-                onload: function (r) {
-                    console.log('[AO3→Wayback] AO3 accessibility check:', r.status, 'for', url);
-                    // AO3 returns 404 (not 403) for login-required content
-                    // when accessed without a valid session.
-                    resolve(r.status !== 404);
-                },
-                // On network error or timeout, assume accessible so we still
-                // attempt the archive rather than silently skipping.
-                onerror: function () { resolve(true); },
-                ontimeout: function () { resolve(true); },
-            });
-        });
-    }
-
-    // Check the Wayback CDX API to see whether a snapshot of a URL was
-    // created today. Returns a Promise<boolean>.
-    // The target URL is passed as a query param value (encodeURIComponent),
-    // so there is no URL-in-path encoding problem.
+    // check the wayback cdx api to see if a snapshot was created today.
+    // i pass the target url as a query param value (encodeURIComponent)
+    // so there's no url-in-path encoding problem here
     function checkCdx(url) {
         return new Promise(function (resolve) {
             var today = new Date();
@@ -404,7 +378,7 @@
                 String(today.getMonth() + 1).padStart(2, '0') +
                 String(today.getDate()).padStart(2, '0');
 
-            // matchType=prefix matches any query-param variant Wayback stored.
+            // matchType=prefix catches any query-param variant wayback stored
             var cdxUrl = 'https://web.archive.org/cdx/search/cdx' +
                 '?output=json&limit=1&fl=timestamp&matchType=prefix' +
                 '&from=' + yyyymmdd +
@@ -431,45 +405,46 @@
         });
     }
 
-    // Archive a single URL.
-    //
-    // Step 1 — pre-check (anonymous HEAD to AO3):
-    //   Simulate what Wayback's crawler sees. If AO3 returns 404 without
-    //   cookies, Wayback would get the same result, so we reject immediately
-    //   with a clear "restricted" message rather than wasting a save attempt.
-    //
-    // Step 2 — save (GM_openInTab):
-    //   Opens https://web.archive.org/save/{encoded-url} in a background tab.
-    //   Real browser navigation bypasses all extension HTTP sandboxing; %3F
-    //   is preserved as a path character so the full AO3 URL including view
-    //   params reaches Wayback correctly. Tab auto-closes after 30 s.
-    //
-    // Step 3 — verify (Wayback CDX):
-    //   Checks after 35 s whether a snapshot from today appears in CDX.
-    //   Resolves with { url } on success, rejects with Error on failure.
+    // how long to wait before checking cdx — wayback usually processes
+    // saves within ~30s but i give it a bit extra to be safe
     var CDX_CHECK_DELAY_MS = 35000;
+    // close the save tab after 30s — enough time for wayback to start the crawl
     var TAB_CLOSE_DELAY_MS = 30000;
+    // these are read from settings at call time so changes take effect
+    // without a page reload
+    function maxRetries()    { return settings.maxRetries; }
+    function retryDelayMs()  { return settings.retryDelayMs; }
 
+    // opens a single save tab for a url and closes it after TAB_CLOSE_DELAY_MS.
+    // i use GM_openInTab instead of xhr/fetch because those kept getting dropped
+    // or having the ? in the url split off by the extension's http layer.
+    // real browser navigation preserves %3F in the path so the full ao3 url
+    // (view params and all) reaches wayback correctly.
+    function openSaveTab(url) {
+        var saveUrl = 'https://web.archive.org/save/' +
+            url.replace('?', '%3F').replace(/&/g, '%26');
+
+        console.log('[AO3→Wayback] opening save tab:', saveUrl);
+        var tab = GM_openInTab(saveUrl, { active: false, insert: false });
+        setTimeout(function () {
+            try { tab.close(); } catch (_) {}
+        }, TAB_CLOSE_DELAY_MS);
+    }
+
+    // sends a url to wayback and verifies via cdx. retries up to MAX_RETRIES
+    // times if cdx comes back empty (e.g. wayback returned 404 to ao3 and
+    // didn't actually save anything). resolves with { url } on success,
+    // rejects with an error after all attempts are exhausted.
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
-            checkAo3Accessible(url).then(function (accessible) {
-                if (!accessible) {
-                    var restrictedMsg = 'Skipped ' + url +
-                        ' — AO3 returned 404 without login.' +
-                        ' This work is restricted to registered users;' +
-                        ' Wayback Machine cannot access it.';
-                    logError('saveToWayback:restricted', restrictedMsg);
-                    reject(new Error(restrictedMsg));
-                    return;
-                }
+            var attempt = 0;
 
-                var saveUrl = 'https://web.archive.org/save/' +
-                    url.replace('?', '%3F').replace(/&/g, '%26');
+            function tryOnce() {
+                attempt++;
+                console.log('[AO3→Wayback] attempt', attempt, 'of', maxRetries() + 1, 'for', url);
 
-                console.log('[AO3→Wayback] Opening save tab:', saveUrl);
-                var tab;
                 try {
-                    tab = GM_openInTab(saveUrl, { active: false, insert: false });
+                    openSaveTab(url);
                 } catch (e) {
                     var openErr = 'GM_openInTab failed for ' + url + ': ' + String(e);
                     logError('saveToWayback:open', openErr);
@@ -478,22 +453,33 @@
                 }
 
                 setTimeout(function () {
-                    try { tab.close(); } catch (_) {}
-                }, TAB_CLOSE_DELAY_MS);
-
-                setTimeout(function () {
                     checkCdx(url).then(function (found) {
                         if (found) {
+                            console.log('[AO3→Wayback] verified after attempt', attempt, ':', url);
                             resolve({ url: url });
+                        } else if (attempt <= maxRetries()) {
+                            // cdx is empty — wayback probably got a 404 from ao3.
+                            // wait a bit then try again
+                            console.log('[AO3→Wayback] cdx miss on attempt', attempt, '-- retrying in', retryDelayMs() / 1000, 's');
+                            showBanner(
+                                '🔁 Wayback did not save it (attempt ' + attempt + '/' + (maxRetries() + 1) + ') -- retrying...',
+                                'info',
+                                retryDelayMs() + 5000
+                            );
+                            setTimeout(tryOnce, retryDelayMs());
                         } else {
-                            var missMsg = 'No CDX snapshot found for ' + url +
-                                ' — the save may have failed or is still processing.';
+                            // all attempts exhausted
+                            var missMsg = 'no cdx snapshot found for ' + url +
+                                ' after ' + attempt + ' attempt(s)' +
+                                ' — wayback may be blocked by ao3 or the save failed';
                             logError('saveToWayback:cdx-miss', missMsg);
                             reject(new Error(missMsg));
                         }
                     });
                 }, CDX_CHECK_DELAY_MS);
-            });
+            }
+
+            tryOnce();
         });
     }
 
@@ -511,10 +497,9 @@
         showBanner('⏳ Sending ' + count + ' ' + noun + ' to the Wayback Machine…', 'info', 30000);
         console.log('[AO3→Wayback] Starting archive of', count, noun);
 
-        // Show an immediate "sending" notice so the user knows something
-        // is happening. The result banner replaces it after ~50 seconds
-        // once the CDX verification completes.
-        showBanner('⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine… (verifying in ~50s)', 'info', 55000);
+        // show an immediate notice — cdx check fires after 35s per attempt,
+        // so worst case (2 retries) takes ~35 + 20 + 35 + 20 + 35 = ~145s
+        showBanner('⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine… (up to ' + (maxRetries() + 1) + ' attempts)', 'info', 150000);
 
         Promise.allSettled(urlArray.map(saveToWayback)).then(function (results) {
             var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
@@ -540,14 +525,14 @@
 
 
     // ================================================================
-    // SETTINGS UI
-    // A ⚙ button at the bottom-right opens a modal settings panel,
-    // styled to match AO3's default cream/red colour scheme.
+    // settings ui
+    // a ⚙ button at the bottom-right opens a modal panel styled
+    // to match ao3's default cream/red colour scheme
     // ================================================================
 
     function injectSettingsUI(pageData) {
 
-        // ---- Floating gear button ----------------------------------------
+        // ── floating gear button
 
         var gearBtn = document.createElement('button');
         gearBtn.id = 'ao3wayback-settings-btn';
@@ -573,7 +558,7 @@
         document.body.appendChild(gearBtn);
 
 
-        // ---- Modal overlay -----------------------------------------------
+        // ── modal overlay
 
         var overlay = document.createElement('div');
         overlay.id = 'ao3wayback-modal';
@@ -592,7 +577,7 @@
         document.body.appendChild(overlay);
 
 
-        // ---- Modal box ---------------------------------------------------
+        // ── modal box
 
         var box = document.createElement('div');
         Object.assign(box.style, {
@@ -610,7 +595,7 @@
         overlay.appendChild(box);
 
 
-        // ---- Close button ------------------------------------------------
+        // ── close button
 
         var closeBtn = document.createElement('button');
         closeBtn.textContent = '✕';
@@ -629,7 +614,7 @@
         box.appendChild(closeBtn);
 
 
-        // ---- Title -------------------------------------------------------
+        // ── title
 
         var titleEl = document.createElement('h2');
         titleEl.textContent = 'AO3 to Wayback Machine';
@@ -643,7 +628,7 @@
         box.appendChild(titleEl);
 
 
-        // ---- Helper: section heading ------------------------------------
+        // ── helper: section heading
 
         function sectionHead(text) {
             var el = document.createElement('div');
@@ -657,7 +642,7 @@
         }
 
 
-        // ---- Checkbox: archive plain URL --------------------------------
+        // ── checkbox: archive plain url
 
         box.appendChild(sectionHead('Options'));
 
@@ -681,7 +666,7 @@
         box.appendChild(plainUrlLabel);
 
 
-        // ---- Radio: date format -----------------------------------------
+        // ── radio: date format
 
         box.appendChild(sectionHead('Date format'));
 
@@ -717,7 +702,7 @@
         box.appendChild(fmtGroup);
 
 
-        // ---- Text: note label -------------------------------------------
+        // ── text: note label
 
         box.appendChild(sectionHead('Note label'));
 
@@ -739,7 +724,66 @@
         box.appendChild(noteLabelInput);
 
 
-        // ---- Error log --------------------------------------------------
+        // ── retry settings
+        box.appendChild(sectionHead('Retry settings'));
+
+        var retryRow = document.createElement('div');
+        Object.assign(retryRow.style, {
+            display: 'flex',
+            gap: '12px',
+            alignItems: 'center',
+            marginBottom: '10px',
+        });
+
+        var retriesLabel = document.createElement('label');
+        retriesLabel.textContent = 'Max retries';
+        retriesLabel.htmlFor = 'ao3wayback-retries';
+        retriesLabel.style.whiteSpace = 'nowrap';
+
+        var retriesInput = document.createElement('input');
+        retriesInput.type = 'number';
+        retriesInput.id = 'ao3wayback-retries';
+        retriesInput.min = '0';
+        retriesInput.max = '5';
+        retriesInput.value = String(settings.maxRetries);
+        Object.assign(retriesInput.style, {
+            width: '52px',
+            padding: '4px 6px',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            fontSize: '13px',
+            background: '#fff',
+            color: '#2a2a2a',
+        });
+
+        var delayLabel = document.createElement('label');
+        delayLabel.textContent = 'Retry delay (s)';
+        delayLabel.htmlFor = 'ao3wayback-retrydelay';
+        delayLabel.style.whiteSpace = 'nowrap';
+
+        var delayInput = document.createElement('input');
+        delayInput.type = 'number';
+        delayInput.id = 'ao3wayback-retrydelay';
+        delayInput.min = '10';
+        delayInput.max = '120';
+        delayInput.value = String(settings.retryDelayMs / 1000);
+        Object.assign(delayInput.style, {
+            width: '52px',
+            padding: '4px 6px',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            fontSize: '13px',
+            background: '#fff',
+            color: '#2a2a2a',
+        });
+
+        retryRow.appendChild(retriesLabel);
+        retryRow.appendChild(retriesInput);
+        retryRow.appendChild(delayLabel);
+        retryRow.appendChild(delayInput);
+        box.appendChild(retryRow);
+
+        // ── error log button
 
         box.appendChild(sectionHead('Diagnostics'));
 
@@ -763,7 +807,7 @@
         box.appendChild(logBtn);
 
 
-        // ---- Save / Cancel row ------------------------------------------
+        // ── save / cancel row
 
         var btnRow = document.createElement('div');
         Object.assign(btnRow.style, {
@@ -795,7 +839,7 @@
         box.appendChild(btnRow);
 
 
-        // ---- Open / close logic -----------------------------------------
+        // ── open / close logic
 
         function openModal() {
             plainUrlCheck.checked = settings.alsoArchivePlainUrl;
@@ -803,6 +847,8 @@
                 dateFormatRadios[fmt].checked = settings.dateFormat === fmt;
             });
             noteLabelInput.value = settings.noteDivider;
+            retriesInput.value = String(settings.maxRetries);
+            delayInput.value = String(settings.retryDelayMs / 1000);
             logBtn.textContent = '📋 Copy error log (' + _errorLog.length + ' entr' +
                 (_errorLog.length === 1 ? 'y' : 'ies') + ')';
             overlay.style.display = 'flex';
@@ -828,6 +874,8 @@
                 alsoArchivePlainUrl: plainUrlCheck.checked,
                 dateFormat: selectedFmt,
                 noteDivider: noteLabelInput.value.trim() || DEFAULTS.noteDivider,
+                maxRetries: Math.min(5, Math.max(0, parseInt(retriesInput.value, 10) || 0)),
+                retryDelayMs: Math.min(120000, Math.max(10000, (parseInt(delayInput.value, 10) || 20) * 1000)),
             };
 
             saveSettings(updated);
@@ -843,13 +891,13 @@
 
 
     // ================================================================
-    // INIT
+    // init
     // ================================================================
 
     var pageData = collectPageData();
 
-    // Inject the bookmark note whenever the textarea appears.
-    // AO3 loads the form via AJAX so a MutationObserver is required.
+    // inject the note whenever the textarea appears — ao3 loads the
+    // bookmark form via ajax so i need a mutationobserver
     function onNodeAdded(node) {
         if (node.nodeType !== Node.ELEMENT_NODE) return;
         var field = node.id === 'bookmark_notes'
@@ -869,7 +917,7 @@
         injectBookmarkNote(pageData);
     }
 
-    // Trigger archiving when the bookmark form is submitted.
+    // trigger archiving when the bookmark form is submitted
     window.addEventListener('submit', function (e) {
         var form = e.target;
         if (!form || !form.action) return;

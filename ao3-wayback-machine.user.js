@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.0
+// @version      1.1
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -105,7 +105,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.2',
+            version: '2.3',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -408,36 +408,64 @@
     // how long to wait before checking cdx — wayback usually processes
     // saves within ~30s but i give it a bit extra to be safe
     var CDX_CHECK_DELAY_MS = 35000;
-    // close the save tab after 30s — enough time for wayback to start the crawl
+    // close the save tab after this long — enough time for wayback to crawl
     var TAB_CLOSE_DELAY_MS = 30000;
-    // these are read from settings at call time so changes take effect
-    // without a page reload
-    function maxRetries()    { return settings.maxRetries; }
-    function retryDelayMs()  { return settings.retryDelayMs; }
+    // these read from settings at call time so changes apply without reload
+    function maxRetries()   { return settings.maxRetries; }
+    function retryDelayMs() { return settings.retryDelayMs; }
 
-    // opens a single save tab for a url and closes it after TAB_CLOSE_DELAY_MS.
-    // i use GM_openInTab instead of xhr/fetch because those kept getting dropped
-    // or having the ? in the url split off by the extension's http layer.
-    // real browser navigation preserves %3F in the path so the full ao3 url
-    // (view params and all) reaches wayback correctly.
+    // true when running on a touch device (mobile/tablet).
+    // on desktop we open save tabs in the background so they don't interrupt
+    // the user. on mobile, background tabs get suspended by the browser before
+    // wayback can load them (confirmed on firefox android), so we open them
+    // in the foreground instead and let the user navigate back manually.
+    var IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+
+    // opens a save tab for a url and schedules it to close after TAB_CLOSE_DELAY_MS.
+    // i use GM_openInTab instead of xhr/fetch because those kept failing —
+    // either dropped silently or the ? in the url got split off by the
+    // extension's http layer. real browser navigation preserves %3F in the
+    // path so the full ao3 url (view params and all) reaches wayback correctly.
+    // returns the tab handle so callers can track it if needed.
     function openSaveTab(url) {
         var saveUrl = 'https://web.archive.org/save/' +
             url.replace('?', '%3F').replace(/&/g, '%26');
 
-        console.log('[AO3→Wayback] opening save tab:', saveUrl);
-        var tab = GM_openInTab(saveUrl, { active: false, insert: false });
-        setTimeout(function () {
-            try { tab.close(); } catch (_) {}
-        }, TAB_CLOSE_DELAY_MS);
+        console.log('[AO3→Wayback] opening save tab (touch=' + IS_TOUCH + '):', saveUrl);
+
+        // on mobile/tablet open in foreground — background tabs get suspended
+        // by the browser before wayback finishes loading, so the save never
+        // actually happens. the user will need to navigate back after.
+        var tab = GM_openInTab(saveUrl, {
+            active: IS_TOUCH,
+            insert: true,
+        });
+
+        if (IS_TOUCH) {
+            // on touch devices we close the tab after a longer delay to give
+            // wayback time to fully load before we yank it away
+            setTimeout(function () {
+                try { tab.close(); } catch (_) {}
+            }, TAB_CLOSE_DELAY_MS * 2);
+        } else {
+            setTimeout(function () {
+                try { tab.close(); } catch (_) {}
+            }, TAB_CLOSE_DELAY_MS);
+        }
+
+        return tab;
     }
 
-    // sends a url to wayback and verifies via cdx. retries up to MAX_RETRIES
-    // times if cdx comes back empty (e.g. wayback returned 404 to ao3 and
-    // didn't actually save anything). resolves with { url } on success,
+    // sends a url to wayback and verifies via cdx. retries up to maxRetries()
+    // times if cdx comes back empty. resolves with { url } on success,
     // rejects with an error after all attempts are exhausted.
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
             var attempt = 0;
+
+            // on touch devices cdx check needs more time since we use a
+            // longer tab lifetime — add extra buffer
+            var cdxDelay = IS_TOUCH ? CDX_CHECK_DELAY_MS * 2 : CDX_CHECK_DELAY_MS;
 
             function tryOnce() {
                 attempt++;
@@ -458,8 +486,8 @@
                             console.log('[AO3→Wayback] verified after attempt', attempt, ':', url);
                             resolve({ url: url });
                         } else if (attempt <= maxRetries()) {
-                            // cdx is empty — wayback probably got a 404 from ao3.
-                            // wait a bit then try again
+                            // cdx is empty — wayback probably got blocked by ao3
+                            // or is still processing. wait then try again.
                             console.log('[AO3→Wayback] cdx miss on attempt', attempt, '-- retrying in', retryDelayMs() / 1000, 's');
                             showBanner(
                                 '🔁 Wayback did not save it (attempt ' + attempt + '/' + (maxRetries() + 1) + ') -- retrying...',
@@ -471,12 +499,12 @@
                             // all attempts exhausted
                             var missMsg = 'no cdx snapshot found for ' + url +
                                 ' after ' + attempt + ' attempt(s)' +
-                                ' — wayback may be blocked by ao3 or the save failed';
+                                ' -- wayback may be blocked by ao3 or the save failed';
                             logError('saveToWayback:cdx-miss', missMsg);
                             reject(new Error(missMsg));
                         }
                     });
-                }, CDX_CHECK_DELAY_MS);
+                }, cdxDelay);
             }
 
             tryOnce();
@@ -485,6 +513,10 @@
 
     var _hasRun = false;
 
+    // on touch devices we archive urls one at a time with a gap between them.
+    // opening multiple foreground tabs at once on mobile is disorienting and
+    // the browser may suspend the earlier ones before they finish loading.
+    // on desktop we run them all in parallel since they are background tabs.
     function archiveAll(urls) {
         if (_hasRun) return;
         _hasRun = true;
@@ -494,14 +526,34 @@
         var count = urlArray.length;
         var noun = count === 1 ? 'fic' : 'fics';
 
-        showBanner('⏳ Sending ' + count + ' ' + noun + ' to the Wayback Machine…', 'info', 30000);
-        console.log('[AO3→Wayback] Starting archive of', count, noun);
+        // worst case time: (cdxDelay + retryDelay) * retries * urls
+        var perAttempt = (IS_TOUCH ? CDX_CHECK_DELAY_MS * 2 : CDX_CHECK_DELAY_MS) + retryDelayMs();
+        var worstCaseSec = Math.ceil((perAttempt * (maxRetries() + 1) * count) / 1000);
+        showBanner(
+            '⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine...' +
+            (IS_TOUCH ? ' (check the new tab)' : ''),
+            'info',
+            worstCaseSec * 1000
+        );
 
-        // show an immediate notice — cdx check fires after 35s per attempt,
-        // so worst case (2 retries) takes ~35 + 20 + 35 + 20 + 35 = ~145s
-        showBanner('⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine… (up to ' + (maxRetries() + 1) + ' attempts)', 'info', 150000);
+        if (IS_TOUCH && count > 1) {
+            // queue saves one at a time on touch devices — give each tab time
+            // to start loading before opening the next one
+            var TAB_QUEUE_DELAY_MS = TAB_CLOSE_DELAY_MS * 2 + 5000;
+            var promises = urlArray.map(function (url, i) {
+                return new Promise(function (resolve, reject) {
+                    setTimeout(function () {
+                        saveToWayback(url).then(resolve, reject);
+                    }, i * TAB_QUEUE_DELAY_MS);
+                });
+            });
 
-        Promise.allSettled(urlArray.map(saveToWayback)).then(function (results) {
+            Promise.allSettled(promises).then(handleResults);
+        } else {
+            Promise.allSettled(urlArray.map(saveToWayback)).then(handleResults);
+        }
+
+        function handleResults(results) {
             var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
             var fail = results.filter(function (r) { return r.status === 'rejected'; });
 
@@ -510,7 +562,7 @@
             } else if (ok.length === 0) {
                 showBanner(
                     '❌ Could not verify archive for ' + count + ' ' + noun +
-                    '. Work may require AO3 login. Open ⚙ → Copy error log.',
+                    '. Open ⚙ → Copy error log.',
                     'error', 12000
                 );
             } else {
@@ -520,7 +572,7 @@
                     'error', 10000
                 );
             }
-        });
+        }
     }
 
 

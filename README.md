@@ -70,15 +70,20 @@ Settings are saved persistently and apply immediately.
 
 ## How archiving works
 
-- When you submit a bookmark, the script opens a background tab to `https://web.archive.org/save/[url]`, which tells the Wayback Machine to crawl and archive the fic
-- The tab closes automatically after 30 seconds
-- After 35 seconds, the script checks the Wayback CDX API to confirm an archive was actually created today
-- If no archive is found, the script waits and tries again (up to the configured number of retries)
-- The status banner updates at each step so you can follow along
+1. When you submit a bookmark, the script opens a tab to `https://web.archive.org/save/[url]`, which tells the Wayback Machine to crawl and snapshot the fic
+   - On **desktop**, the tab opens in the background so it does not interrupt you
+   - On **mobile/tablet**, the tab opens in the foreground, since background tabs are suspended by the browser before Wayback can load them — you will need to navigate back to AO3 manually
+2. The tab closes automatically after 30 seconds (60 seconds on mobile)
+3. After 35 seconds (70 on mobile), the script checks the [Wayback CDX API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server) to confirm a snapshot was actually created today
+4. If no snapshot is found, the script retries with a progressively simpler URL to work around AO3's crawler blocks:
+   - **Attempt 1** — `?view_adult=true&view_full_work=true`
+   - **Attempt 2** — `?view_adult=true` only
+   - **Attempt 3** — base URL, no parameters
+5. The status banner updates at each step so you can follow along
 
-With default settings (2 retries, 20 second delay), the worst case before a final failure is reported is about 2.5 minutes.
+With default settings (2 retries, 20 second delay), the worst case before a final failure is reported is about **2.5 minutes**.
 
-> Note: AO3 blocks some unauthenticated crawlers at the server level, which can cause Wayback to receive a 404 even for fully public fics. This is an AO3-side restriction the script cannot work around. Retries help in cases where AO3 is temporarily rate-limiting, but persistent 404s from Wayback mean the save did not go through. This is something I can't do anything about it, that's why I keept changing the code in the beginning cause I was desperately trying to bypass it.
+> Note: AO3 blocks some unauthenticated crawlers at the server level, which can cause Wayback to receive a "job failed" or 404 even for fully public fics. **This is an AO3-side restriction the script cannot work around.** Retries help in cases where AO3 is temporarily rate-limiting, but persistent 404s from Wayback mean the save did not go through. This is something I can't do anything about it, that's why I kept changing the code in the beginning cause I was desperately trying to bypass it.
 
 ## Reporting issues
 
@@ -88,7 +93,7 @@ If archiving fails, the status banner will say so. To get a diagnostic report:
 - Click "📋 Copy error log"
 - Paste the copied JSON into a new GitHub issue
 
-**Note: The above function may not work, so if there's no logs for you, just manually explain what happened.**
+> Note: The above function may not work, so if there's no logs for you, just manually explain what happened.
 
 When writing the issue, please read the template and its instructions properly.
 

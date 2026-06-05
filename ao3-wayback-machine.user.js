@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.1
+// @version      1.2
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -105,7 +105,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.3',
+            version: '2.4',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -456,50 +456,71 @@
         return tab;
     }
 
-    // sends a url to wayback and verifies via cdx. retries up to maxRetries()
-    // times if cdx comes back empty. resolves with { url } on success,
-    // rejects with an error after all attempts are exhausted.
+    // build the url to try for a given attempt number.
+    // each retry strips params to try to get past ao3 blocking wayback:
+    //   attempt 1 — full url with both view params
+    //   attempt 2 — view_adult only (drop view_full_work)
+    //   attempt 3+ — bare base url, no params at all
+    // the note already uses a web/*/ wildcard so any of these landing in
+    // cdx will make the link work regardless of which variant got saved.
+    function urlForAttempt(url, attempt) {
+        if (attempt === 1) return url;
+        if (attempt === 2) {
+            // keep only ?view_adult=true
+            var base = url.split('?')[0];
+            return base + '?view_adult=true';
+        }
+        return url.split('?')[0];
+    }
+
+    // sends a url to wayback and verifies via cdx. each retry uses a
+    // progressively simpler url variant in case ao3 is blocking the
+    // parameterised form. resolves with { url } on success, rejects
+    // after all attempts are exhausted.
     function saveToWayback(url) {
         return new Promise(function (resolve, reject) {
             var attempt = 0;
 
-            // on touch devices cdx check needs more time since we use a
-            // longer tab lifetime — add extra buffer
+            // touch devices need a longer cdx wait to match the extended tab lifetime
             var cdxDelay = IS_TOUCH ? CDX_CHECK_DELAY_MS * 2 : CDX_CHECK_DELAY_MS;
 
             function tryOnce() {
                 attempt++;
-                console.log('[AO3→Wayback] attempt', attempt, 'of', maxRetries() + 1, 'for', url);
+                var attemptUrl = urlForAttempt(url, attempt);
+                console.log('[AO3→Wayback] attempt', attempt, 'of', maxRetries() + 1,
+                    'url:', attemptUrl);
 
                 try {
-                    openSaveTab(url);
+                    openSaveTab(attemptUrl);
                 } catch (e) {
-                    var openErr = 'GM_openInTab failed for ' + url + ': ' + String(e);
+                    var openErr = 'GM_openInTab failed for ' + attemptUrl + ': ' + String(e);
                     logError('saveToWayback:open', openErr);
                     reject(new Error(openErr));
                     return;
                 }
 
                 setTimeout(function () {
+                    // check cdx for the base url — matches any variant wayback stored
                     checkCdx(url).then(function (found) {
                         if (found) {
-                            console.log('[AO3→Wayback] verified after attempt', attempt, ':', url);
-                            resolve({ url: url });
+                            console.log('[AO3→Wayback] verified after attempt', attempt, ':', attemptUrl);
+                            resolve({ url: attemptUrl });
                         } else if (attempt <= maxRetries()) {
-                            // cdx is empty — wayback probably got blocked by ao3
-                            // or is still processing. wait then try again.
-                            console.log('[AO3→Wayback] cdx miss on attempt', attempt, '-- retrying in', retryDelayMs() / 1000, 's');
+                            // still nothing — wayback is probably getting blocked.
+                            // next attempt will try a simpler url variant.
+                            var nextUrl = urlForAttempt(url, attempt + 1);
+                            console.log('[AO3→Wayback] cdx miss, next attempt will try:', nextUrl);
                             showBanner(
-                                '🔁 Wayback did not save it (attempt ' + attempt + '/' + (maxRetries() + 1) + ') -- retrying...',
+                                '🔁 Wayback did not save it (attempt ' + attempt + '/' +
+                                (maxRetries() + 1) + ') -- retrying with simpler url...',
                                 'info',
                                 retryDelayMs() + 5000
                             );
                             setTimeout(tryOnce, retryDelayMs());
                         } else {
-                            // all attempts exhausted
                             var missMsg = 'no cdx snapshot found for ' + url +
                                 ' after ' + attempt + ' attempt(s)' +
-                                ' -- wayback may be blocked by ao3 or the save failed';
+                                ' -- wayback is likely being blocked by ao3';
                             logError('saveToWayback:cdx-miss', missMsg);
                             reject(new Error(missMsg));
                         }

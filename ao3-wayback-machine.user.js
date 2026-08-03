@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.2
+// @version      1.3
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -68,6 +68,8 @@
         noteDivider: 'Last Bookmarked: ',
         maxRetries: 2,
         retryDelayMs: 20000,
+        iaAccessKey: '',
+        iaSecretKey: '',
     };
 
     function loadSettings() {
@@ -105,7 +107,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.4',
+            version: '2.5',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -371,6 +373,11 @@
     // check the wayback cdx api to see if a snapshot was created today.
     // i pass the target url as a query param value (encodeURIComponent)
     // so there's no url-in-path encoding problem here
+    // ── cdx verification ────────────────────────────────────────────
+
+    // checks wayback's cdx api to see if a snapshot of the base url
+    // exists today. i use the base url (no query params) as the key
+    // so it matches regardless of which param variant wayback stored.
     function checkCdx(url) {
         return new Promise(function (resolve) {
             var today = new Date();
@@ -378,13 +385,12 @@
                 String(today.getMonth() + 1).padStart(2, '0') +
                 String(today.getDate()).padStart(2, '0');
 
-            // matchType=prefix catches any query-param variant wayback stored
             var cdxUrl = 'https://web.archive.org/cdx/search/cdx' +
                 '?output=json&limit=1&fl=timestamp&matchType=prefix' +
                 '&from=' + yyyymmdd +
                 '&url=' + encodeURIComponent(url.split('?')[0]);
 
-            console.log('[AO3→Wayback] CDX check:', cdxUrl);
+            console.log('[AO3→Wayback] cdx check:', cdxUrl);
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: cdxUrl,
@@ -392,8 +398,9 @@
                 onload: function (r) {
                     try {
                         var rows = JSON.parse(r.responseText || '[]');
+                        // rows[0] is the header row; actual results start at rows[1]
                         var found = Array.isArray(rows) && rows.length > 1;
-                        console.log('[AO3→Wayback] CDX found:', found, 'for', url);
+                        console.log('[AO3→Wayback] cdx found:', found, 'for', url);
                         resolve(found);
                     } catch (_) {
                         resolve(false);
@@ -405,114 +412,210 @@
         });
     }
 
+
+    // ── timing constants ─────────────────────────────────────────────
+
     // how long to wait before checking cdx — wayback usually processes
-    // saves within ~30s but i give it a bit extra to be safe
+    // saves within ~30s but i give it a bit extra
     var CDX_CHECK_DELAY_MS = 35000;
-    // close the save tab after this long — enough time for wayback to crawl
+    // close the save tab after this long
     var TAB_CLOSE_DELAY_MS = 30000;
-    // these read from settings at call time so changes apply without reload
+    // read retry settings from the live config each time
     function maxRetries()   { return settings.maxRetries; }
     function retryDelayMs() { return settings.retryDelayMs; }
 
-    // true when running on a touch device (mobile/tablet).
-    // on desktop we open save tabs in the background so they don't interrupt
-    // the user. on mobile, background tabs get suspended by the browser before
-    // wayback can load them (confirmed on firefox android), so we open them
-    // in the foreground instead and let the user navigate back manually.
+    // touch = mobile or tablet. matters for tab behaviour (see openSaveTab)
     var IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
 
-    // opens a save tab for a url and schedules it to close after TAB_CLOSE_DELAY_MS.
-    // i use GM_openInTab instead of xhr/fetch because those kept failing —
-    // either dropped silently or the ? in the url got split off by the
-    // extension's http layer. real browser navigation preserves %3F in the
-    // path so the full ao3 url (view params and all) reaches wayback correctly.
-    // returns the tab handle so callers can track it if needed.
+
+    // ── spn2 api (preferred when ia credentials are configured) ──────
+    //
+    // the save page now 2 api lets me POST the url + ao3 cookies directly
+    // to wayback using my internet archive credentials. wayback's crawler
+    // then fetches ao3 with those cookies attached, so it sees the page as
+    // a logged-in user instead of an anonymous bot — which is why it was
+    // getting 404s before.
+    //
+    // to use this: create a free internet archive account, get your s3-like
+    // api keys from https://archive.org/account/s3.php, and enter them in
+    // the ⚙ settings panel.
+    //
+    // if no ia credentials are set the script falls back to GM_openInTab.
+
+    // polls the spn2 job status endpoint until the job succeeds, fails,
+    // or we run out of attempts.
+    function pollSpn2Job(jobId, url, resolve, reject) {
+        var polls = 0;
+        var maxPolls = 60; // poll for up to 5 minutes (every 5s)
+
+        function poll() {
+            polls++;
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: 'https://web.archive.org/save/status/' + jobId,
+                headers: { 'Accept': 'application/json' },
+                timeout: 10000,
+                onload: function (r) {
+                    var data;
+                    try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
+                    console.log('[AO3→Wayback] spn2 job', jobId, 'status:', data.status);
+
+                    if (data.status === 'success') {
+                        resolve({ url: url, method: 'spn2' });
+                    } else if (data.status === 'error') {
+                        var msg = 'spn2 job failed for ' + url + ': ' + (data.message || 'unknown');
+                        logError('spn2:job-error', msg);
+                        reject(new Error(msg));
+                    } else if (polls < maxPolls) {
+                        setTimeout(poll, 5000);
+                    } else {
+                        var timeoutMsg = 'spn2 job ' + jobId + ' timed out for ' + url;
+                        logError('spn2:timeout', timeoutMsg);
+                        reject(new Error(timeoutMsg));
+                    }
+                },
+                onerror: function () {
+                    if (polls < maxPolls) setTimeout(poll, 5000);
+                    else reject(new Error('spn2 status poll network error for ' + url));
+                },
+                ontimeout: function () {
+                    if (polls < maxPolls) setTimeout(poll, 5000);
+                    else reject(new Error('spn2 status poll timed out for ' + url));
+                },
+            });
+        }
+
+        setTimeout(poll, 5000);
+    }
+
+    // submits a url to the spn2 api and polls for the result.
+    // passes the user's ao3 cookies so wayback crawls as a logged-in user,
+    // bypassing ao3's anti-bot 404s.
+    function saveViaSPN2(url) {
+        return new Promise(function (resolve, reject) {
+            // grab whatever cookies the page can see. _otwarchive_session is
+            // httpOnly so we won't get it, but view_adult and user_credentials
+            // (remember-me token) are readable and between them they let wayback
+            // bypass the adult gate and the anti-bot block.
+            var cookies = document.cookie;
+
+            var body = 'url=' + encodeURIComponent(url);
+            if (cookies) {
+                body += '&capture_cookie=' + encodeURIComponent(cookies);
+            }
+            // capture the full page including outlinks so nothing is missed
+            body += '&capture_all=on';
+
+            console.log('[AO3→Wayback] spn2 POST for:', url);
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://web.archive.org/save',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    // ia s3-like auth — LOW {access}:{secret}
+                    'Authorization': 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey,
+                    'Accept': 'application/json',
+                },
+                data: body,
+                timeout: 30000,
+                onload: function (r) {
+                    var data;
+                    try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
+
+                    if (data.job_id) {
+                        console.log('[AO3→Wayback] spn2 job created:', data.job_id);
+                        pollSpn2Job(data.job_id, url, resolve, reject);
+                    } else {
+                        var msg = 'spn2 submit failed for ' + url +
+                            ' (status ' + r.status + '): ' + r.responseText;
+                        logError('spn2:submit', msg);
+                        reject(new Error(msg));
+                    }
+                },
+                onerror: function (e) {
+                    var msg = 'spn2 network error for ' + url + ': ' + (e.statusText || 'unknown');
+                    logError('spn2:network', msg);
+                    reject(new Error(msg));
+                },
+                ontimeout: function () {
+                    var msg = 'spn2 submit timed out for ' + url;
+                    logError('spn2:timeout', msg);
+                    reject(new Error(msg));
+                },
+            });
+        });
+    }
+
+
+    // ── tab-based fallback (no ia credentials needed) ────────────────
+    //
+    // opens a save tab for a url. i use GM_openInTab instead of xhr/fetch
+    // because those kept failing — either dropped silently or the ? in the
+    // url got split off by the extension's http layer. real browser navigation
+    // preserves %3F in the path so the full ao3 url reaches wayback correctly.
+    //
+    // on mobile, background tabs get suspended before wayback can load them
+    // (confirmed on firefox android), so i open them in the foreground instead.
     function openSaveTab(url) {
         var saveUrl = 'https://web.archive.org/save/' +
             url.replace('?', '%3F').replace(/&/g, '%26');
 
         console.log('[AO3→Wayback] opening save tab (touch=' + IS_TOUCH + '):', saveUrl);
 
-        // on mobile/tablet open in foreground — background tabs get suspended
-        // by the browser before wayback finishes loading, so the save never
-        // actually happens. the user will need to navigate back after.
-        var tab = GM_openInTab(saveUrl, {
-            active: IS_TOUCH,
-            insert: true,
-        });
+        var tab = GM_openInTab(saveUrl, { active: IS_TOUCH, insert: true });
 
-        if (IS_TOUCH) {
-            // on touch devices we close the tab after a longer delay to give
-            // wayback time to fully load before we yank it away
-            setTimeout(function () {
-                try { tab.close(); } catch (_) {}
-            }, TAB_CLOSE_DELAY_MS * 2);
-        } else {
-            setTimeout(function () {
-                try { tab.close(); } catch (_) {}
-            }, TAB_CLOSE_DELAY_MS);
-        }
+        // close the tab after it has had enough time for wayback to crawl.
+        // mobile gets double the time since it needs to fully load in the foreground.
+        setTimeout(function () {
+            try { tab.close(); } catch (_) {}
+        }, IS_TOUCH ? TAB_CLOSE_DELAY_MS * 2 : TAB_CLOSE_DELAY_MS);
 
         return tab;
     }
 
-    // build the url to try for a given attempt number.
-    // each retry strips params to try to get past ao3 blocking wayback:
-    //   attempt 1 — full url with both view params
-    //   attempt 2 — view_adult only (drop view_full_work)
-    //   attempt 3+ — bare base url, no params at all
-    // the note already uses a web/*/ wildcard so any of these landing in
-    // cdx will make the link work regardless of which variant got saved.
+    // builds the url to try for a given attempt number.
+    // each retry strips one layer of params to try to get past ao3 blocking:
+    //   attempt 1 — ?view_adult=true&view_full_work=true
+    //   attempt 2 — ?view_adult=true only
+    //   attempt 3+ — bare base url
     function urlForAttempt(url, attempt) {
         if (attempt === 1) return url;
-        if (attempt === 2) {
-            // keep only ?view_adult=true
-            var base = url.split('?')[0];
-            return base + '?view_adult=true';
-        }
+        if (attempt === 2) return url.split('?')[0] + '?view_adult=true';
         return url.split('?')[0];
     }
 
-    // sends a url to wayback and verifies via cdx. each retry uses a
-    // progressively simpler url variant in case ao3 is blocking the
-    // parameterised form. resolves with { url } on success, rejects
-    // after all attempts are exhausted.
-    function saveToWayback(url) {
+    // sends a url via the tab method and verifies with cdx.
+    // each retry uses a simpler url in case ao3 is blocking the parameterised form.
+    function saveViaTab(url) {
         return new Promise(function (resolve, reject) {
             var attempt = 0;
-
             // touch devices need a longer cdx wait to match the extended tab lifetime
             var cdxDelay = IS_TOUCH ? CDX_CHECK_DELAY_MS * 2 : CDX_CHECK_DELAY_MS;
 
             function tryOnce() {
                 attempt++;
                 var attemptUrl = urlForAttempt(url, attempt);
-                console.log('[AO3→Wayback] attempt', attempt, 'of', maxRetries() + 1,
-                    'url:', attemptUrl);
+                console.log('[AO3→Wayback] tab attempt', attempt, 'of', maxRetries() + 1, ':', attemptUrl);
 
                 try {
                     openSaveTab(attemptUrl);
                 } catch (e) {
                     var openErr = 'GM_openInTab failed for ' + attemptUrl + ': ' + String(e);
-                    logError('saveToWayback:open', openErr);
+                    logError('saveViaTab:open', openErr);
                     reject(new Error(openErr));
                     return;
                 }
 
                 setTimeout(function () {
-                    // check cdx for the base url — matches any variant wayback stored
                     checkCdx(url).then(function (found) {
                         if (found) {
-                            console.log('[AO3→Wayback] verified after attempt', attempt, ':', attemptUrl);
-                            resolve({ url: attemptUrl });
+                            resolve({ url: attemptUrl, method: 'tab' });
                         } else if (attempt <= maxRetries()) {
-                            // still nothing — wayback is probably getting blocked.
-                            // next attempt will try a simpler url variant.
                             var nextUrl = urlForAttempt(url, attempt + 1);
                             console.log('[AO3→Wayback] cdx miss, next attempt will try:', nextUrl);
                             showBanner(
                                 '🔁 Wayback did not save it (attempt ' + attempt + '/' +
-                                (maxRetries() + 1) + ') -- retrying with simpler url...',
+                                (maxRetries() + 1) + ') -- retrying...',
                                 'info',
                                 retryDelayMs() + 5000
                             );
@@ -520,8 +623,9 @@
                         } else {
                             var missMsg = 'no cdx snapshot found for ' + url +
                                 ' after ' + attempt + ' attempt(s)' +
-                                ' -- wayback is likely being blocked by ao3';
-                            logError('saveToWayback:cdx-miss', missMsg);
+                                ' -- wayback is likely being blocked by ao3.' +
+                                ' tip: add internet archive api keys in settings for better results.';
+                            logError('saveViaTab:cdx-miss', missMsg);
                             reject(new Error(missMsg));
                         }
                     });
@@ -532,12 +636,21 @@
         });
     }
 
+    // main entry point — uses spn2 if ia credentials are set, tab method otherwise
+    function saveToWayback(url) {
+        if (settings.iaAccessKey && settings.iaSecretKey) {
+            console.log('[AO3→Wayback] using spn2 api for:', url);
+            return saveViaSPN2(url);
+        }
+        console.log('[AO3→Wayback] using tab method for:', url);
+        return saveViaTab(url);
+    }
+
     var _hasRun = false;
 
-    // on touch devices we archive urls one at a time with a gap between them.
-    // opening multiple foreground tabs at once on mobile is disorienting and
-    // the browser may suspend the earlier ones before they finish loading.
-    // on desktop we run them all in parallel since they are background tabs.
+    // on touch devices we archive urls one at a time — opening multiple
+    // foreground tabs at once is disorienting and the browser may suspend
+    // earlier ones. on desktop we run them all in parallel.
     function archiveAll(urls) {
         if (_hasRun) return;
         _hasRun = true;
@@ -546,35 +659,31 @@
         var urlArray = Array.from(urls);
         var count = urlArray.length;
         var noun = count === 1 ? 'fic' : 'fics';
+        var usingSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey);
 
-        // worst case time: (cdxDelay + retryDelay) * retries * urls
-        var perAttempt = (IS_TOUCH ? CDX_CHECK_DELAY_MS * 2 : CDX_CHECK_DELAY_MS) + retryDelayMs();
-        var worstCaseSec = Math.ceil((perAttempt * (maxRetries() + 1) * count) / 1000);
         showBanner(
             '⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine...' +
-            (IS_TOUCH ? ' (check the new tab)' : ''),
+            (IS_TOUCH && !usingSPN2 ? ' (check the new tab)' : ''),
             'info',
-            worstCaseSec * 1000
+            300000
         );
 
-        if (IS_TOUCH && count > 1) {
-            // queue saves one at a time on touch devices — give each tab time
-            // to start loading before opening the next one
+        var savePromises;
+        if (IS_TOUCH && !usingSPN2 && count > 1) {
+            // queue tab saves one at a time on touch devices
             var TAB_QUEUE_DELAY_MS = TAB_CLOSE_DELAY_MS * 2 + 5000;
-            var promises = urlArray.map(function (url, i) {
+            savePromises = urlArray.map(function (url, i) {
                 return new Promise(function (resolve, reject) {
                     setTimeout(function () {
                         saveToWayback(url).then(resolve, reject);
                     }, i * TAB_QUEUE_DELAY_MS);
                 });
             });
-
-            Promise.allSettled(promises).then(handleResults);
         } else {
-            Promise.allSettled(urlArray.map(saveToWayback)).then(handleResults);
+            savePromises = urlArray.map(saveToWayback);
         }
 
-        function handleResults(results) {
+        Promise.allSettled(savePromises).then(function (results) {
             var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
             var fail = results.filter(function (r) { return r.status === 'rejected'; });
 
@@ -582,18 +691,17 @@
                 showBanner('✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.', 'success');
             } else if (ok.length === 0) {
                 showBanner(
-                    '❌ Could not verify archive for ' + count + ' ' + noun +
-                    '. Open ⚙ → Copy error log.',
+                    '❌ Could not archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.',
                     'error', 12000
                 );
             } else {
                 showBanner(
                     '⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' +
-                    fail.length + ' unverified. Open ⚙ → Copy error log.',
+                    fail.length + ' failed. Open ⚙ → Copy error log.',
                     'error', 10000
                 );
             }
-        }
+        });
     }
 
 
@@ -797,6 +905,61 @@
         box.appendChild(noteLabelInput);
 
 
+        // ── internet archive api keys (optional but recommended)
+        box.appendChild(sectionHead('Internet Archive API (optional)'));
+
+        var iaNote = document.createElement('p');
+        iaNote.textContent = 'Add your free IA S3 keys to use the SPN2 API. ' +
+            'This fixes the "job failed" / 404 errors from AO3 blocking ' +
+            "Wayback's crawler. Get keys at archive.org/account/s3.php";
+        Object.assign(iaNote.style, {
+            margin: '4px 0 8px',
+            fontSize: '12px',
+            color: '#666',
+            lineHeight: '1.4',
+        });
+        box.appendChild(iaNote);
+
+        var accessKeyInput = document.createElement('input');
+        accessKeyInput.type = 'text';
+        accessKeyInput.id = 'ao3wayback-ia-access';
+        accessKeyInput.placeholder = 'Access key';
+        accessKeyInput.value = settings.iaAccessKey || '';
+        accessKeyInput.autocomplete = 'off';
+        Object.assign(accessKeyInput.style, {
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '6px 8px',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            fontSize: '13px',
+            fontFamily: 'monospace',
+            background: '#fff',
+            color: '#2a2a2a',
+            marginBottom: '6px',
+        });
+        box.appendChild(accessKeyInput);
+
+        var secretKeyInput = document.createElement('input');
+        secretKeyInput.type = 'password';
+        secretKeyInput.id = 'ao3wayback-ia-secret';
+        secretKeyInput.placeholder = 'Secret key';
+        secretKeyInput.value = settings.iaSecretKey || '';
+        secretKeyInput.autocomplete = 'off';
+        Object.assign(secretKeyInput.style, {
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '6px 8px',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            fontSize: '13px',
+            fontFamily: 'monospace',
+            background: '#fff',
+            color: '#2a2a2a',
+            marginBottom: '4px',
+        });
+        box.appendChild(secretKeyInput);
+
         // ── retry settings
         box.appendChild(sectionHead('Retry settings'));
 
@@ -922,6 +1085,8 @@
             noteLabelInput.value = settings.noteDivider;
             retriesInput.value = String(settings.maxRetries);
             delayInput.value = String(settings.retryDelayMs / 1000);
+            accessKeyInput.value = settings.iaAccessKey || '';
+            secretKeyInput.value = settings.iaSecretKey || '';
             logBtn.textContent = '📋 Copy error log (' + _errorLog.length + ' entr' +
                 (_errorLog.length === 1 ? 'y' : 'ies') + ')';
             overlay.style.display = 'flex';
@@ -949,6 +1114,8 @@
                 noteDivider: noteLabelInput.value.trim() || DEFAULTS.noteDivider,
                 maxRetries: Math.min(5, Math.max(0, parseInt(retriesInput.value, 10) || 0)),
                 retryDelayMs: Math.min(120000, Math.max(10000, (parseInt(delayInput.value, 10) || 20) * 1000)),
+                iaAccessKey: accessKeyInput.value.trim(),
+                iaSecretKey: secretKeyInput.value.trim(),
             };
 
             saveSettings(updated);

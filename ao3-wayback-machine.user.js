@@ -107,7 +107,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.5',
+            version: '2.6',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -450,6 +450,9 @@
 
         function poll() {
             polls++;
+            var elapsed = Math.round(polls * 5);
+            showBanner('⏳ IA API: archiving in progress... (' + elapsed + 's)', 'info', 8000);
+
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: 'https://web.archive.org/save/status/' + jobId,
@@ -458,18 +461,20 @@
                 onload: function (r) {
                     var data;
                     try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
-                    console.log('[AO3→Wayback] spn2 job', jobId, 'status:', data.status);
+                    console.log('[AO3→Wayback] spn2 job', jobId, 'status:', data.status, data);
 
                     if (data.status === 'success') {
                         resolve({ url: url, method: 'spn2' });
                     } else if (data.status === 'error') {
-                        var msg = 'spn2 job failed for ' + url + ': ' + (data.message || 'unknown');
+                        var msg = 'spn2 job failed for ' + url + ': ' + (data.message || 'unknown') +
+                            ' (raw: ' + r.responseText.slice(0, 200) + ')';
                         logError('spn2:job-error', msg);
                         reject(new Error(msg));
                     } else if (polls < maxPolls) {
+                        // still pending — keep polling
                         setTimeout(poll, 5000);
                     } else {
-                        var timeoutMsg = 'spn2 job ' + jobId + ' timed out for ' + url;
+                        var timeoutMsg = 'spn2 job ' + jobId + ' timed out after ' + elapsed + 's for ' + url;
                         logError('spn2:timeout', timeoutMsg);
                         reject(new Error(timeoutMsg));
                     }
@@ -507,6 +512,7 @@
             body += '&capture_all=on';
 
             console.log('[AO3→Wayback] spn2 POST for:', url);
+            showBanner('📡 IA API: submitting save request...', 'info', 30000);
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: 'https://web.archive.org/save',
@@ -524,11 +530,19 @@
 
                     if (data.job_id) {
                         console.log('[AO3→Wayback] spn2 job created:', data.job_id);
+                        showBanner('📡 IA API: job queued, waiting for Wayback...', 'info', 60000);
                         pollSpn2Job(data.job_id, url, resolve, reject);
                     } else {
-                        var msg = 'spn2 submit failed for ' + url +
-                            ' (status ' + r.status + '): ' + r.responseText;
+                        var msg = 'spn2 submit failed (status ' + r.status + '): ' +
+                            r.responseText.slice(0, 300);
                         logError('spn2:submit', msg);
+                        // show a banner so the user knows immediately
+                        // common causes: wrong api keys, ia account not verified
+                        showBanner(
+                            '❌ IA API error (status ' + r.status + ').' +
+                            (r.status === 401 ? ' Check your access/secret keys in ⚙.' : ' Open ⚙ → Copy error log.'),
+                            'error', 15000
+                        );
                         reject(new Error(msg));
                     }
                 },
@@ -661,12 +675,16 @@
         var noun = count === 1 ? 'fic' : 'fics';
         var usingSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey);
 
-        showBanner(
-            '⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine...' +
-            (IS_TOUCH && !usingSPN2 ? ' (check the new tab)' : ''),
-            'info',
-            300000
-        );
+        if (usingSPN2) {
+            showBanner('📡 Sending ' + count + ' ' + noun + ' to IA API... (no tab will open)', 'info', 30000);
+        } else {
+            showBanner(
+                '⏳ Saving ' + count + ' ' + noun + ' to the Wayback Machine...' +
+                (IS_TOUCH ? ' (check the new tab)' : ''),
+                'info',
+                300000
+            );
+        }
 
         var savePromises;
         if (IS_TOUCH && !usingSPN2 && count > 1) {
@@ -1166,7 +1184,10 @@
             form.id === 'new_bookmark' ||
             form.classList.contains('bookmark-form');
         if (isBookmarkForm && pageData.urls.size > 0) {
+            console.log('[AO3→Wayback] bookmark form submitted, archiving', pageData.urls.size, 'url(s)');
             archiveAll(pageData.urls);
+        } else {
+            console.log('[AO3→Wayback] form submitted but not a bookmark form or no urls:', form.action);
         }
     }, true);
 

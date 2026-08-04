@@ -55,6 +55,11 @@
     }
 
 
+    // timestamp set as early as possible so we can tell later whether a stored
+    // archive result was written on this page or a previous one
+    var _scriptStartTime = Date.now();
+
+
     // ================================================================
     // settings — persisted with GM_getValue / GM_setValue.
     // edit via the ⚙ button at the bottom-right of any ao3 page
@@ -107,7 +112,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.7',
+            version: '2.8',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -184,6 +189,40 @@
             return !(i.type === 'tab' && i.url === id);
         });
         savePending(items);
+    }
+
+    // stores the final archive result (success or error message) so the next
+    // page the user navigates to can show it as a banner.
+    var ARCHIVE_RESULT_KEY = 'ao3wayback_result';
+
+    function storeResult(type, message) {
+        GM_setValue(ARCHIVE_RESULT_KEY, JSON.stringify({
+            type: type,
+            message: message,
+            timestamp: Date.now(),
+        }));
+    }
+
+    // called at page load to show any result that was written on a previous page.
+    // i compare result.timestamp to _scriptStartTime:
+    //   - result older than this page starting → written on a previous page → show it
+    //   - result newer than this page starting → written on THIS page → skip it
+    //     (the live banner already showed it; no need to double-show)
+    function checkAndShowStoredResult() {
+        try {
+            var raw = GM_getValue(ARCHIVE_RESULT_KEY, null);
+            if (!raw) return;
+            var result = JSON.parse(raw);
+            // drop stale results (older than 5 minutes)
+            if (Date.now() - result.timestamp > 300000) {
+                GM_setValue(ARCHIVE_RESULT_KEY, null);
+                return;
+            }
+            // only show if the result was written before this page loaded
+            if (result.timestamp >= _scriptStartTime) return;
+            GM_setValue(ARCHIVE_RESULT_KEY, null);
+            showBanner(result.message, result.type);
+        } catch (_) {}
     }
 
 
@@ -761,21 +800,23 @@
         Promise.allSettled(savePromises).then(function (results) {
             var ok = results.filter(function (r) { return r.status === 'fulfilled'; });
             var fail = results.filter(function (r) { return r.status === 'rejected'; });
+            var msg, type;
 
             if (fail.length === 0) {
-                showBanner('✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.', 'success');
+                msg = '✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.';
+                type = 'success';
             } else if (ok.length === 0) {
-                showBanner(
-                    '❌ Could not archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.',
-                    'error', 12000
-                );
+                msg = '❌ Could not archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.';
+                type = 'error';
             } else {
-                showBanner(
-                    '⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' +
-                    fail.length + ' failed. Open ⚙ → Copy error log.',
-                    'error', 10000
-                );
+                msg = '⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' +
+                    fail.length + ' failed. Open ⚙ → Copy error log.';
+                type = 'error';
             }
+
+            showBanner(msg, type, type === 'success' ? 6000 : 12000);
+            // persist so the next page the user navigates to also shows the result
+            storeResult(type, msg);
         });
     }
 
@@ -801,12 +842,16 @@
                     item.url,
                     function (result) {
                         removePendingItem('spn2', item.jobId);
-                        showBanner('✅ Archived to the Wayback Machine.', 'success');
+                        var m = '✅ Archived to the Wayback Machine.';
+                        showBanner(m, 'success');
+                        storeResult('success', m);
                     },
                     function (err) {
                         removePendingItem('spn2', item.jobId);
                         logError('resume:spn2', String(err));
-                        showBanner('❌ Archive failed. Open ⚙ → Copy error log.', 'error', 10000);
+                        var m = '❌ Archive failed. Open ⚙ → Copy error log.';
+                        showBanner(m, 'error', 10000);
+                        storeResult('error', m);
                     }
                 );
             } else if (item.type === 'tab') {
@@ -816,10 +861,14 @@
                     checkCdx(item.url).then(function (found) {
                         removePendingItem('tab', item.url);
                         if (found) {
-                            showBanner('✅ Archived to the Wayback Machine.', 'success');
+                            var mOk = '✅ Archived to the Wayback Machine.';
+                            showBanner(mOk, 'success');
+                            storeResult('success', mOk);
                         } else {
                             logError('resume:tab', 'no cdx snapshot for ' + item.url);
-                            showBanner('❌ No snapshot found. Open ⚙ → Copy error log.', 'error', 10000);
+                            var mFail = '❌ No snapshot found. Open ⚙ → Copy error log.';
+                            showBanner(mFail, 'error', 10000);
+                            storeResult('error', mFail);
                         }
                     });
                 }, delay);
@@ -1300,5 +1349,11 @@
 
     // check for any pending archives left over from previous page
     resumePendingArchives();
+
+    // show the final result from the previous page (if any).
+    // i delay 100ms so the DOM is fully settled before the banner appears,
+    // and to avoid a race condition where a result written milliseconds ago
+    // on this same page-load might slip through the timestamp guard.
+    setTimeout(checkAndShowStoredResult, 100);
 
 })();

@@ -107,7 +107,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.6',
+            version: '2.7',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -138,6 +138,52 @@
             showBanner('❌ Could not copy log — check the browser console.', 'error');
         }
         document.body.removeChild(ta);
+    }
+
+
+    // ================================================================
+    // persistent archive status
+    // ================================================================
+    //
+    // when a bookmark is submitted ao3 may navigate the page, killing any
+    // in-flight timers (cdx checks, spn2 poll loops). i store each pending
+    // archive job in GM_setValue so the next ao3 page can pick it up and
+    // resume showing progress / the final result.
+
+    var ARCHIVE_STATUS_KEY = 'ao3wayback_pending';
+
+    function loadPending() {
+        try {
+            var raw = GM_getValue(ARCHIVE_STATUS_KEY, null);
+            if (!raw) return [];
+            var items = JSON.parse(raw);
+            // drop items older than 15 minutes — they have definitely timed out
+            var cutoff = Date.now() - 900000;
+            return items.filter(function (i) { return i.startedAt > cutoff; });
+        } catch (_) { return []; }
+    }
+
+    function savePending(items) {
+        GM_setValue(ARCHIVE_STATUS_KEY, JSON.stringify(items));
+    }
+
+    function addPendingItem(item) {
+        var items = loadPending();
+        // avoid duplicates
+        items = items.filter(function (i) {
+            if (item.type === 'spn2') return i.jobId !== item.jobId;
+            return !(i.type === 'tab' && i.url === item.url);
+        });
+        items.push(item);
+        savePending(items);
+    }
+
+    function removePendingItem(type, id) {
+        var items = loadPending().filter(function (i) {
+            if (type === 'spn2') return !(i.type === 'spn2' && i.jobId === id);
+            return !(i.type === 'tab' && i.url === id);
+        });
+        savePending(items);
     }
 
 
@@ -531,7 +577,12 @@
                     if (data.job_id) {
                         console.log('[AO3→Wayback] spn2 job created:', data.job_id);
                         showBanner('📡 IA API: job queued, waiting for Wayback...', 'info', 60000);
-                        pollSpn2Job(data.job_id, url, resolve, reject);
+                        // persist so the next page can resume if navigation happens now
+                        addPendingItem({ type: 'spn2', jobId: data.job_id, url: url, startedAt: Date.now() });
+                        // wrap resolve/reject to clear the stored item when done
+                        function spn2Done(r) { removePendingItem('spn2', data.job_id); resolve(r); }
+                        function spn2Fail(e) { removePendingItem('spn2', data.job_id); reject(e); }
+                        pollSpn2Job(data.job_id, url, spn2Done, spn2Fail);
                     } else {
                         var msg = 'spn2 submit failed (status ' + r.status + '): ' +
                             r.responseText.slice(0, 300);
@@ -620,8 +671,14 @@
                     return;
                 }
 
+                // persist so the next page can resume the cdx check if
+                // ao3 navigates away before the timeout fires
+                var checkAfter = Date.now() + cdxDelay;
+                addPendingItem({ type: 'tab', url: url, attemptUrl: attemptUrl, checkAfter: checkAfter, startedAt: Date.now() });
+
                 setTimeout(function () {
                     checkCdx(url).then(function (found) {
+                        removePendingItem('tab', url);
                         if (found) {
                             resolve({ url: attemptUrl, method: 'tab' });
                         } else if (attempt <= maxRetries()) {
@@ -718,6 +775,54 @@
                     fail.length + ' failed. Open ⚙ → Copy error log.',
                     'error', 10000
                 );
+            }
+        });
+    }
+
+
+    // ================================================================
+    // resume pending archives
+    // ================================================================
+    //
+    // called at page load to pick up any jobs that were still running
+    // when ao3 navigated away after the bookmark was submitted.
+
+    function resumePendingArchives() {
+        var items = loadPending();
+        if (items.length === 0) return;
+
+        console.log('[AO3→Wayback] resuming', items.length, 'pending archive(s)');
+        showBanner('⏳ Resuming ' + items.length + ' pending archive(s) from last bookmark...', 'info', 15000);
+
+        items.forEach(function (item) {
+            if (item.type === 'spn2') {
+                pollSpn2Job(
+                    item.jobId,
+                    item.url,
+                    function (result) {
+                        removePendingItem('spn2', item.jobId);
+                        showBanner('✅ Archived to the Wayback Machine.', 'success');
+                    },
+                    function (err) {
+                        removePendingItem('spn2', item.jobId);
+                        logError('resume:spn2', String(err));
+                        showBanner('❌ Archive failed. Open ⚙ → Copy error log.', 'error', 10000);
+                    }
+                );
+            } else if (item.type === 'tab') {
+                // wait out whatever cdx delay remains, then check
+                var delay = Math.max(0, item.checkAfter - Date.now());
+                setTimeout(function () {
+                    checkCdx(item.url).then(function (found) {
+                        removePendingItem('tab', item.url);
+                        if (found) {
+                            showBanner('✅ Archived to the Wayback Machine.', 'success');
+                        } else {
+                            logError('resume:tab', 'no cdx snapshot for ' + item.url);
+                            showBanner('❌ No snapshot found. Open ⚙ → Copy error log.', 'error', 10000);
+                        }
+                    });
+                }, delay);
             }
         });
     }
@@ -1192,5 +1297,8 @@
     }, true);
 
     injectSettingsUI(pageData);
+
+    // check for any pending archives left over from previous page
+    resumePendingArchives();
 
 })();

@@ -2,7 +2,7 @@
 
 A userscript that automatically saves AO3 fics to the [Internet Archive Wayback Machine](https://web.archive.org/) when you bookmark them, and fills your bookmark notes with a Wayback link, the fic's author, and the date you bookmarked it.
 
-Expect constant updates because the auto-archive function may randomly stop working.
+Expect random updates because the auto-archive function may randomly stop working.
 
 ## Features
 
@@ -67,7 +67,7 @@ Go to [archive.org/account/signup](https://archive.org/account/signup) and creat
  
 ### Step 2 - Get your S3 API keys
  
-1. Sign up/log in to your [Internet Archive](https://archive.org/) account
+1. Go to your [Internet Archive](https://archive.org/) account
 2. Go to [archive.org/account/s3.php](https://archive.org/account/s3.php)
 3. Click **Generate new keys** if no keys are shown
 4. Copy your **Access Key** and **Secret Key** (keep these private and should not be shared to anyone)
@@ -87,6 +87,8 @@ Go to [archive.org/account/signup](https://archive.org/account/signup) and creat
 - As the save progresses you will see banners like **"📡 IA API: archiving in progress... (10s)"**
 - When done, a **"✅ Archived"** banner confirms success
 - If something goes wrong (wrong keys, network issue, etc.) a **"❌ IA API error"** banner appears with a hint
+
+> Note: The banners may not appear when you load to the next page, but sometimes you may see the **"✅ Archived"** banner after a while. Most of the time, it will archived successfully regardless, but it's better to check whether it's truly archived yourself for now. I will find a way to make the banners persistent.
  
 ## How archiving works (without IA API keys)
  

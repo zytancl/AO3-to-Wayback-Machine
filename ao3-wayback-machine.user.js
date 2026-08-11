@@ -29,6 +29,7 @@
 // @match        http://insecure.archiveofourown.org/collections/*/works/*
 // @connect      web.archive.org
 // @grant        GM_xmlhttpRequest
+// @grant        GM_cookie
 // @grant        GM_openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -112,7 +113,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.8',
+            version: '2.9',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -514,6 +515,43 @@
 
 
     // ── spn2 api (preferred when ia credentials are configured) ──────
+
+    // collects all ao3 cookies for the current domain.
+    // document.cookie only gives us non-httpOnly cookies, which misses
+    // _otwarchive_session — the main session token ao3 uses to recognise
+    // logged-in users. GM_cookie (tampermonkey extension API) can read
+    // httpOnly cookies from inside the extension sandbox, so i try that
+    // first and fall back to document.cookie for other managers.
+    function getAo3Cookies() {
+        return new Promise(function (resolve) {
+            var fallback = document.cookie;
+
+            try {
+                if (typeof GM_cookie !== 'undefined' &&
+                    typeof GM_cookie.list === 'function') {
+
+                    GM_cookie.list({}, function (cookies, error) {
+                        if (error || !Array.isArray(cookies) || cookies.length === 0) {
+                            console.log('[AO3→Wayback] GM_cookie.list failed or empty, using document.cookie');
+                            resolve(fallback);
+                            return;
+                        }
+                        var cookieStr = cookies.map(function (c) {
+                            return c.name + '=' + c.value;
+                        }).join('; ');
+                        console.log('[AO3→Wayback] collected', cookies.length, 'cookies via GM_cookie');
+                        resolve(cookieStr || fallback);
+                    });
+                } else {
+                    console.log('[AO3→Wayback] GM_cookie not available, using document.cookie');
+                    resolve(fallback);
+                }
+            } catch (e) {
+                console.warn('[AO3→Wayback] GM_cookie error:', e);
+                resolve(fallback);
+            }
+        });
+    }
     //
     // the save page now 2 api lets me POST the url + ao3 cookies directly
     // to wayback using my internet archive credentials. wayback's crawler
@@ -583,20 +621,18 @@
     // bypassing ao3's anti-bot 404s.
     function saveViaSPN2(url) {
         return new Promise(function (resolve, reject) {
-            // grab whatever cookies the page can see. _otwarchive_session is
-            // httpOnly so we won't get it, but view_adult and user_credentials
-            // (remember-me token) are readable and between them they let wayback
-            // bypass the adult gate and the anti-bot block.
-            var cookies = document.cookie;
-
+            // use getAo3Cookies() to collect ALL ao3 cookies including the
+            // httpOnly _otwarchive_session token. without it wayback's crawler
+            // looks anonymous to ao3 and gets a 404 even for public fics.
+            getAo3Cookies().then(function (cookies) {
             var body = 'url=' + encodeURIComponent(url);
             if (cookies) {
                 body += '&capture_cookie=' + encodeURIComponent(cookies);
             }
-            // capture the full page including outlinks so nothing is missed
             body += '&capture_all=on';
 
-            console.log('[AO3→Wayback] spn2 POST for:', url);
+            console.log('[AO3→Wayback] spn2 POST for:', url,
+                '| cookies length:', cookies ? cookies.length : 0);
             showBanner('📡 IA API: submitting save request...', 'info', 30000);
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -647,6 +683,7 @@
                     reject(new Error(msg));
                 },
             });
+            }); // end getAo3Cookies().then
         });
     }
 

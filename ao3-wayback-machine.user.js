@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.4
+// @version      1.3
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -113,7 +113,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.9',
+            version: '3.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -589,8 +589,19 @@
                     if (data.status === 'success') {
                         resolve({ url: url, method: 'spn2' });
                     } else if (data.status === 'error') {
-                        var msg = 'spn2 job failed for ' + url + ': ' + (data.message || 'unknown') +
-                            ' (raw: ' + r.responseText.slice(0, 200) + ')';
+                        // common cause: ao3 returns 404 to wayback's crawler.
+                        // ao3 blocks internet archive ips at the network level,
+                        // so this fails even with valid session cookies.
+                        // capture_screenshot=on (headless chromium) may help
+                        // since it uses a real browser ua, but an ip block
+                        // will still reject it.
+                        var reason = data.message || 'unknown';
+                        var isBlocked = reason.indexOf('404') !== -1 ||
+                            r.responseText.indexOf('404') !== -1 ||
+                            r.responseText.indexOf('does not exist') !== -1;
+                        var msg = 'spn2 job failed for ' + url + ': ' + reason +
+                            (isBlocked ? ' -- ao3 appears to be blocking wayback (ip-level block, not fixable from userscript)' : '') +
+                            ' | raw: ' + r.responseText.slice(0, 200);
                         logError('spn2:job-error', msg);
                         reject(new Error(msg));
                     } else if (polls < maxPolls) {
@@ -629,7 +640,13 @@
             if (cookies) {
                 body += '&capture_cookie=' + encodeURIComponent(cookies);
             }
-            body += '&capture_all=on';
+            // capture_all: save all page resources (css, images, etc.)
+            // capture_screenshot: tells wayback to use a headless chromium
+            //   browser instead of a plain http crawler. the headless browser
+            //   has a realistic user agent and runs javascript, which gives it
+            //   a better chance of getting past ao3's bot detection than a
+            //   bare http request does.
+            body += '&capture_all=on&capture_screenshot=on';
 
             console.log('[AO3→Wayback] spn2 POST for:', url,
                 '| cookies length:', cookies ? cookies.length : 0);
@@ -770,8 +787,9 @@
                         } else {
                             var missMsg = 'no cdx snapshot found for ' + url +
                                 ' after ' + attempt + ' attempt(s)' +
-                                ' -- wayback is likely being blocked by ao3.' +
-                                ' tip: add internet archive api keys in settings for better results.';
+                                ' -- ao3 is likely blocking wayback at the ip level.' +
+                                ' adding ia api keys (see settings) enables headless-browser capture' +
+                                ' which may help, but an ip block cannot be bypassed from a userscript.';
                             logError('saveViaTab:cdx-miss', missMsg);
                             reject(new Error(missMsg));
                         }
@@ -843,7 +861,8 @@
                 msg = '✅ Archived ' + ok.length + ' ' + noun + ' to the Wayback Machine.';
                 type = 'success';
             } else if (ok.length === 0) {
-                msg = '❌ Could not archive ' + count + ' ' + noun + '. Open ⚙ → Copy error log.';
+                msg = '❌ Could not archive ' + count + ' ' + noun +
+                    '. AO3 may be blocking Wayback crawler. Open settings gear for error log.';
                 type = 'error';
             } else {
                 msg = '⚠️ Archived ' + ok.length + '/' + count + ' ' + noun + '. ' +

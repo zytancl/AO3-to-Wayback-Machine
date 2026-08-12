@@ -113,7 +113,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '3.0',
+            version: '3.1',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -515,6 +515,49 @@
 
 
     // ── spn2 api (preferred when ia credentials are configured) ──────
+    //
+    // the wayback machine browser extension works by making the spn2 save
+    // request FROM the user's browser, which means the browser automatically
+    // includes the user's archive.org session cookies in the request. ia's
+    // spn2 system then treats it as a logged-in user save rather than an
+    // anonymous api call, which gets a better (headless-browser) capture.
+    //
+    // GM_xmlhttpRequest runs inside the browser and also includes cookies from
+    // the browser's cookie jar for the target domain — so if the user is logged
+    // into archive.org we get the same behaviour as the extension, for free.
+    // we check for that session first and only fall back to s3 api keys if
+    // no session is found.
+
+    // checks for an active archive.org browser session by reading the IA
+    // login cookies via GM_cookie. returns { loggedIn, username }.
+    // if GM_cookie is not available (violentmonkey, safari) returns { loggedIn: false }.
+    function getIaLoginStatus() {
+        return new Promise(function (resolve) {
+            var fallback = { loggedIn: false, username: null };
+            try {
+                if (typeof GM_cookie !== 'undefined' && typeof GM_cookie.list === 'function') {
+                    GM_cookie.list({ url: 'https://web.archive.org' }, function (cookies, err) {
+                        if (err || !Array.isArray(cookies)) { resolve(fallback); return; }
+                        // ia sets logged-in-user and logged-in-sig when you log in
+                        var userCookie = null;
+                        var hasSig = false;
+                        cookies.forEach(function (c) {
+                            if (c.name === 'logged-in-user') userCookie = c;
+                            if (c.name === 'logged-in-sig') hasSig = true;
+                        });
+                        var loggedIn = !!(userCookie && hasSig);
+                        var username = loggedIn ? decodeURIComponent(userCookie.value) : null;
+                        console.log('[AO3→Wayback] ia session detected:', loggedIn, username);
+                        resolve({ loggedIn: loggedIn, username: username });
+                    });
+                } else {
+                    resolve(fallback);
+                }
+            } catch (e) {
+                resolve(fallback);
+            }
+        });
+    }
 
     // collects all ao3 cookies for the current domain.
     // document.cookie only gives us non-httpOnly cookies, which misses
@@ -628,38 +671,56 @@
     }
 
     // submits a url to the spn2 api and polls for the result.
-    // passes the user's ao3 cookies so wayback crawls as a logged-in user,
-    // bypassing ao3's anti-bot 404s.
+    //
+    // auth priority (mirrors the wayback machine browser extension):
+    //   1. ia browser session (logged-in-user + logged-in-sig cookies) — best
+    //      because ia treats these as real-user saves and uses headless chrome
+    //   2. s3 api keys — fallback for users not logged into archive.org
+    //   3. anonymous — last resort, rarely succeeds for ao3
     function saveViaSPN2(url) {
         return new Promise(function (resolve, reject) {
-            // use getAo3Cookies() to collect ALL ao3 cookies including the
-            // httpOnly _otwarchive_session token. without it wayback's crawler
-            // looks anonymous to ao3 and gets a 404 even for public fics.
-            getAo3Cookies().then(function (cookies) {
+            Promise.all([getAo3Cookies(), getIaLoginStatus()]).then(function (res) {
+            var ao3Cookies = res[0];
+            var iaStatus   = res[1];
+
             var body = 'url=' + encodeURIComponent(url);
-            if (cookies) {
-                body += '&capture_cookie=' + encodeURIComponent(cookies);
+            if (ao3Cookies) {
+                body += '&capture_cookie=' + encodeURIComponent(ao3Cookies);
             }
-            // capture_all: save all page resources (css, images, etc.)
-            // capture_screenshot: tells wayback to use a headless chromium
-            //   browser instead of a plain http crawler. the headless browser
-            //   has a realistic user agent and runs javascript, which gives it
-            //   a better chance of getting past ao3's bot detection than a
-            //   bare http request does.
+            // capture_all: fetch all linked resources
+            // capture_screenshot: use headless chromium instead of bare http crawler
             body += '&capture_all=on&capture_screenshot=on';
 
-            console.log('[AO3→Wayback] spn2 POST for:', url,
-                '| cookies length:', cookies ? cookies.length : 0);
-            showBanner('📡 IA API: submitting save request...', 'info', 30000);
+            // build auth headers — prefer browser session over api keys
+            var headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+            };
+
+            if (iaStatus.loggedIn) {
+                // GM_xmlhttpRequest automatically includes the user's archive.org
+                // session cookies because it uses the browser's cookie jar.
+                // this is exactly what the wayback machine browser extension does —
+                // no extra header needed, the session does the auth.
+                console.log('[AO3→Wayback] spn2 using ia browser session (' + iaStatus.username + ')');
+            } else if (settings.iaAccessKey && settings.iaSecretKey) {
+                headers['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
+                console.log('[AO3→Wayback] spn2 using s3 api keys (not logged into archive.org)');
+            } else {
+                console.log('[AO3→Wayback] spn2 anonymous — no session or api keys found');
+            }
+
+            var authMode = iaStatus.loggedIn
+                ? 'browser session'
+                : (settings.iaAccessKey ? 'api keys' : 'anonymous');
+            showBanner('📡 IA API: submitting save request (' + authMode + ')...', 'info', 30000);
+            console.log('[AO3→Wayback] spn2 POST:', url, '| auth:', authMode,
+                '| ao3 cookies length:', ao3Cookies ? ao3Cookies.length : 0);
+
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: 'https://web.archive.org/save',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    // ia s3-like auth — LOW {access}:{secret}
-                    'Authorization': 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey,
-                    'Accept': 'application/json',
-                },
+                headers: headers,
                 data: body,
                 timeout: 30000,
                 onload: function (r) {
@@ -700,7 +761,7 @@
                     reject(new Error(msg));
                 },
             });
-            }); // end getAo3Cookies().then
+            }); // end Promise.all
         });
     }
 
@@ -1133,13 +1194,54 @@
         box.appendChild(noteLabelInput);
 
 
-        // ── internet archive api keys (optional but recommended)
-        box.appendChild(sectionHead('Internet Archive API (optional)'));
+        // ── internet archive section ──────────────────────────────────
+        box.appendChild(sectionHead('Internet Archive'));
+
+        // status badge — filled in by checkIaStatus() below
+        var iaStatusBadge = document.createElement('div');
+        Object.assign(iaStatusBadge.style, {
+            fontSize: '12px',
+            padding: '6px 10px',
+            borderRadius: '4px',
+            marginBottom: '10px',
+            lineHeight: '1.4',
+        });
+        box.appendChild(iaStatusBadge);
+
+        function setIaBadge(loggedIn, username) {
+            if (loggedIn) {
+                iaStatusBadge.textContent = '✅ Logged into archive.org as ' + username +
+                    ' — archiving will use your browser session (like the WM extension).';
+                Object.assign(iaStatusBadge.style, {
+                    background: '#1e2e22',
+                    color: '#a6e3a1',
+                    border: '1px solid #40a04a',
+                });
+            } else {
+                iaStatusBadge.textContent = '⚠️ Not logged into archive.org. ' +
+                    'Log in at archive.org to enable extension-like archiving. ' +
+                    'Or enter S3 API keys below as a fallback.';
+                Object.assign(iaStatusBadge.style, {
+                    background: '#2e2a1e',
+                    color: '#f5c97a',
+                    border: '1px solid #a07a30',
+                });
+            }
+        }
+
+        // check ia login status and update the badge
+        function checkIaStatus() {
+            iaStatusBadge.textContent = 'Checking archive.org login...';
+            Object.assign(iaStatusBadge.style, {
+                background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a',
+            });
+            getIaLoginStatus().then(function (s) { setIaBadge(s.loggedIn, s.username); });
+        }
+        checkIaStatus();
 
         var iaNote = document.createElement('p');
-        iaNote.textContent = 'Add your free IA S3 keys to use the SPN2 API. ' +
-            'This fixes the "job failed" / 404 errors from AO3 blocking ' +
-            "Wayback's crawler. Get keys at archive.org/account/s3.php";
+        iaNote.textContent = 'S3 API keys are optional — only needed if you are not' +
+            ' logged into archive.org. Get keys at archive.org/account/s3.php';
         Object.assign(iaNote.style, {
             margin: '4px 0 8px',
             fontSize: '12px',
@@ -1315,6 +1417,7 @@
             delayInput.value = String(settings.retryDelayMs / 1000);
             accessKeyInput.value = settings.iaAccessKey || '';
             secretKeyInput.value = settings.iaSecretKey || '';
+            checkIaStatus();
             logBtn.textContent = '📋 Copy error log (' + _errorLog.length + ' entr' +
                 (_errorLog.length === 1 ? 'y' : 'ies') + ')';
             overlay.style.display = 'flex';

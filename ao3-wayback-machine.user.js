@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.7
+// @version      1.9
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -114,7 +114,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '3.2',
+            version: '3.4',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -529,53 +529,57 @@
     // we check for that session first and only fall back to s3 api keys if
     // no session is found.
 
-    // checks for an active archive.org session by reading ia login cookies.
-    // ia sets cookies on archive.org itself (not the web.archive.org subdomain),
-    // so i check both domains and merge the results to be safe.
-    // logs all found cookie names to the console to help debug missing-session issues.
+    // checks whether the user is logged into archive.org.
+    //
+    // reading cookies via GM_cookie fails on firefox because its Total Cookie
+    // Protection partitions cookies by top-level domain — scripts running on
+    // archiveofourown.org can't see archive.org cookies even via extension APIs.
+    //
+    // instead, i use GM_xmlhttpRequest to fetch archive.org/account/s3.php.
+    // GM_xmlhttpRequest uses the browser's http stack and includes cookies for
+    // the target domain automatically (this is one of its key differences from
+    // regular XHR). if the user is logged in, ia serves the s3 keys page.
+    // if not, ia redirects to the login page — which we detect via finalUrl.
     function getIaLoginStatus() {
         return new Promise(function (resolve) {
             var fallback = { loggedIn: false, username: null };
-            try {
-                if (typeof GM_cookie !== 'undefined' && typeof GM_cookie.list === 'function') {
-                    // check archive.org first — login cookies are typically set here
-                    GM_cookie.list({ url: 'https://archive.org' }, function (cookies1, err1) {
-                        var list1 = Array.isArray(cookies1) ? cookies1 : [];
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: 'https://archive.org/account/s3.php',
+                timeout: 8000,
+                onload: function (r) {
+                    var finalUrl = r.finalUrl || '';
+                    // redirected to login = not logged in
+                    var loggedIn = r.status === 200 && finalUrl.indexOf('login') === -1;
 
-                        // also check web.archive.org in case any are scoped there
-                        GM_cookie.list({ url: 'https://web.archive.org' }, function (cookies2, err2) {
-                            var list2 = Array.isArray(cookies2) ? cookies2 : [];
+                    // try a few patterns to extract the username from the page
+                    var username = null;
+                    if (loggedIn) {
+                        var patterns = [
+                            /"username"\s*:\s*"([^"]+)"/,
+                            /logged[- ]in as[^<]*<[^>]+>([^<]+)/i,
+                            /"screenname"\s*:\s*"([^"]+)"/,
+                            /my-account[^"]*"[^>]*>\s*([^<\s@][^<@]*@[^<]+)/,
+                        ];
+                        for (var i = 0; i < patterns.length; i++) {
+                            var m = r.responseText.match(patterns[i]);
+                            if (m) { username = m[1].trim(); break; }
+                        }
+                    }
 
-                            // merge, deduplicating by name (list1 takes priority)
-                            var seen = {};
-                            var all = [];
-                            list1.concat(list2).forEach(function (c) {
-                                if (!seen[c.name]) { seen[c.name] = true; all.push(c); }
-                            });
-
-                            // log what we found so users can debug in the console
-                            console.log('[AO3→Wayback] ia cookies found (' + all.length + '):', all.map(function (c) { return c.name; }).join(', ') || '(none)');
-
-                            // ia login cookies
-                            var userCookie = all.find(function (c) { return c.name === 'logged-in-user'; });
-                            var hasSig     = all.some(function (c) { return c.name === 'logged-in-sig'; });
-
-                            // require at least the user cookie — sig is the ideal
-                            // check but may be absent in some ia account configurations
-                            var loggedIn = !!userCookie;
-                            var username = loggedIn ? decodeURIComponent(userCookie.value) : null;
-                            console.log('[AO3→Wayback] ia login status:', loggedIn, '| user:', username, '| sig present:', hasSig);
-                            resolve({ loggedIn: loggedIn, username: username });
-                        });
-                    });
-                } else {
-                    console.log('[AO3→Wayback] GM_cookie not available in this userscript manager');
+                    console.log('[AO3→Wayback] ia auth check: loggedIn=' + loggedIn +
+                        ' | user=' + username + ' | finalUrl=' + finalUrl);
+                    resolve({ loggedIn: loggedIn, username: username });
+                },
+                onerror: function () {
+                    console.warn('[AO3→Wayback] ia auth check network error');
                     resolve(fallback);
-                }
-            } catch (e) {
-                console.warn('[AO3→Wayback] getIaLoginStatus error:', e);
-                resolve(fallback);
-            }
+                },
+                ontimeout: function () {
+                    console.warn('[AO3→Wayback] ia auth check timed out');
+                    resolve(fallback);
+                },
+            });
         });
     }
 
@@ -690,53 +694,24 @@
         setTimeout(poll, 5000);
     }
 
-    // submits a url to the spn2 api and polls for the result.
-    //
-    // auth priority (mirrors the wayback machine browser extension):
-    //   1. ia browser session (logged-in-user + logged-in-sig cookies) — best
-    //      because ia treats these as real-user saves and uses headless chrome
-    //   2. s3 api keys — fallback for users not logged into archive.org
-    //   3. anonymous — last resort, rarely succeeds for ao3
-    function saveViaSPN2(url) {
+    // spn2 capture parameter sets, tried in order on each retry.
+    // starting minimal avoids the heavy headless-chrome crawl that is more
+    // likely to trigger ao3 blocking at the network level ("server does not
+    // respond"). each escalation adds more capture capability.
+    var SPN2_PARAM_SETS = [
+        '',                                      // minimal: plain http, no extras
+        'capture_screenshot=on',                 // headless chrome, single request
+        'capture_all=on&capture_screenshot=on',  // headless chrome + all resources
+    ];
+
+    // makes a single spn2 submit request and returns a Promise<job_id>.
+    // separated from saveViaSPN2 so the retry loop can call it cleanly.
+    function submitSpn2(url, extraParams, headers) {
         return new Promise(function (resolve, reject) {
-            Promise.all([getAo3Cookies(), getIaLoginStatus()]).then(function (res) {
-            var ao3Cookies = res[0];
-            var iaStatus   = res[1];
-
             var body = 'url=' + encodeURIComponent(url);
-            if (ao3Cookies) {
-                body += '&capture_cookie=' + encodeURIComponent(ao3Cookies);
-            }
-            // capture_all: fetch all linked resources
-            // capture_screenshot: use headless chromium instead of bare http crawler
-            body += '&capture_all=on&capture_screenshot=on';
+            if (extraParams) body += '&' + extraParams;
 
-            // build auth headers — prefer browser session over api keys
-            var headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json',
-            };
-
-            if (iaStatus.loggedIn) {
-                // GM_xmlhttpRequest automatically includes the user's archive.org
-                // session cookies because it uses the browser's cookie jar.
-                // this is exactly what the wayback machine browser extension does —
-                // no extra header needed, the session does the auth.
-                console.log('[AO3→Wayback] spn2 using ia browser session (' + iaStatus.username + ')');
-            } else if (settings.iaAccessKey && settings.iaSecretKey) {
-                headers['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
-                console.log('[AO3→Wayback] spn2 using s3 api keys (not logged into archive.org)');
-            } else {
-                console.log('[AO3→Wayback] spn2 anonymous — no session or api keys found');
-            }
-
-            var authMode = iaStatus.loggedIn
-                ? 'browser session'
-                : (settings.iaAccessKey ? 'api keys' : 'anonymous');
-            showBanner('📡 IA API: submitting save request (' + authMode + ')...', 'info', 30000);
-            console.log('[AO3→Wayback] spn2 POST:', url, '| auth:', authMode,
-                '| ao3 cookies length:', ao3Cookies ? ao3Cookies.length : 0);
-
+            console.log('[AO3→Wayback] spn2 submit | params:', extraParams || '(minimal)');
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: 'https://web.archive.org/save',
@@ -746,42 +721,116 @@
                 onload: function (r) {
                     var data;
                     try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
-
                     if (data.job_id) {
-                        console.log('[AO3→Wayback] spn2 job created:', data.job_id);
-                        showBanner('📡 IA API: job queued, waiting for Wayback...', 'info', 60000);
-                        // persist so the next page can resume if navigation happens now
-                        addPendingItem({ type: 'spn2', jobId: data.job_id, url: url, startedAt: Date.now() });
-                        // wrap resolve/reject to clear the stored item when done
-                        function spn2Done(r) { removePendingItem('spn2', data.job_id); resolve(r); }
-                        function spn2Fail(e) { removePendingItem('spn2', data.job_id); reject(e); }
-                        pollSpn2Job(data.job_id, url, spn2Done, spn2Fail);
+                        resolve(data.job_id);
                     } else {
                         var msg = 'spn2 submit failed (status ' + r.status + '): ' +
                             r.responseText.slice(0, 300);
                         logError('spn2:submit', msg);
-                        // show a banner so the user knows immediately
-                        // common causes: wrong api keys, ia account not verified
-                        showBanner(
-                            '❌ IA API error (status ' + r.status + ').' +
-                            (r.status === 401 ? ' Check your access/secret keys in ⚙.' : ' Open ⚙ → Copy error log.'),
-                            'error', 15000
-                        );
-                        reject(new Error(msg));
+                        reject({ status: r.status, msg: msg });
                     }
                 },
                 onerror: function (e) {
-                    var msg = 'spn2 network error for ' + url + ': ' + (e.statusText || 'unknown');
+                    var msg = 'spn2 network error: ' + (e.statusText || 'unknown');
                     logError('spn2:network', msg);
-                    reject(new Error(msg));
+                    reject({ status: 0, msg: msg });
                 },
                 ontimeout: function () {
-                    var msg = 'spn2 submit timed out for ' + url;
+                    var msg = 'spn2 submit timed out';
                     logError('spn2:timeout', msg);
-                    reject(new Error(msg));
+                    reject({ status: 0, msg: msg });
                 },
             });
-            }); // end Promise.all
+        });
+    }
+
+    // submits a url to spn2 and polls for the result.
+    // retries up to maxRetries() times, cycling through SPN2_PARAM_SETS so each
+    // attempt uses a progressively heavier capture mode. this helps when ao3
+    // blocks the headless-chrome crawler ("server does not respond") — the first
+    // attempt uses a minimal plain-http request that is harder to detect.
+    //
+    // auth priority (mirrors the wayback machine browser extension):
+    //   1. ia browser session — GM_xmlhttpRequest includes archive.org cookies
+    //      automatically; ia treats this the same as the wm extension
+    //   2. s3 api keys — fallback if not logged in
+    //   3. anonymous — last resort
+    function saveViaSPN2(url) {
+        return new Promise(function (resolve, reject) {
+            Promise.all([getAo3Cookies(), getIaLoginStatus()]).then(function (res) {
+                var ao3Cookies = res[0];
+                var iaStatus   = res[1];
+
+                var headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json',
+                };
+
+                if (iaStatus.loggedIn) {
+                    console.log('[AO3→Wayback] spn2 using ia browser session (' + iaStatus.username + ')');
+                } else if (settings.iaAccessKey && settings.iaSecretKey) {
+                    headers['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
+                    console.log('[AO3→Wayback] spn2 using s3 api keys');
+                } else {
+                    console.log('[AO3→Wayback] spn2 anonymous (no session or api keys)');
+                }
+
+                // add ao3 cookies to the capture request
+                var baseBody = ao3Cookies
+                    ? '&capture_cookie=' + encodeURIComponent(ao3Cookies)
+                    : '';
+
+                var authMode = iaStatus.loggedIn ? 'browser session'
+                    : (settings.iaAccessKey ? 'api keys' : 'anonymous');
+
+                var attempt = 0;
+
+                function trySubmit() {
+                    attempt++;
+                    var paramSet = SPN2_PARAM_SETS[
+                        Math.min(attempt - 1, SPN2_PARAM_SETS.length - 1)
+                    ];
+                    var fullParams = (baseBody ? baseBody.slice(1) : '') +
+                        (baseBody && paramSet ? '&' : '') + paramSet;
+
+                    showBanner(
+                        '📡 IA API: submitting save request (' + authMode +
+                        (attempt > 1 ? ', attempt ' + attempt : '') + ')...',
+                        'info', 30000
+                    );
+
+                    submitSpn2(url, fullParams, headers).then(function (jobId) {
+                        console.log('[AO3→Wayback] spn2 job created:', jobId);
+                        showBanner('📡 IA API: job queued, waiting for Wayback...', 'info', 60000);
+                        addPendingItem({ type: 'spn2', jobId: jobId, url: url, startedAt: Date.now() });
+
+                        function spn2Done(r) { removePendingItem('spn2', jobId); resolve(r); }
+                        function spn2Fail(e) { removePendingItem('spn2', jobId); reject(e); }
+                        pollSpn2Job(jobId, url, spn2Done, spn2Fail);
+
+                    }, function (err) {
+                        if (attempt <= maxRetries()) {
+                            // submit failed — wait and try with next param set
+                            showBanner(
+                                '🔁 IA API submit failed (attempt ' + attempt + '/' +
+                                (maxRetries() + 1) + ') -- retrying...',
+                                'info', retryDelayMs() + 5000
+                            );
+                            setTimeout(trySubmit, retryDelayMs());
+                        } else {
+                            var status = err.status || 0;
+                            showBanner(
+                                '❌ IA API error (status ' + status + ').' +
+                                (status === 401 ? ' Check your keys in ⚙.' : ' Open ⚙ → Copy error log.'),
+                                'error', 15000
+                            );
+                            reject(new Error(err.msg || 'spn2 failed after ' + attempt + ' attempts'));
+                        }
+                    });
+                }
+
+                trySubmit();
+            });
         });
     }
 

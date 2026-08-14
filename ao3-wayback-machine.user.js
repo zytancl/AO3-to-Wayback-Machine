@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.5
+// @version      1.6
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -28,6 +28,7 @@
 // @match        http://insecure.archiveofourown.org/series/*
 // @match        http://insecure.archiveofourown.org/collections/*/works/*
 // @connect      web.archive.org
+// @connect      archive.org
 // @grant        GM_xmlhttpRequest
 // @grant        GM_cookie
 // @grant        GM_openInTab
@@ -113,7 +114,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '3.1',
+            version: '3.2',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -528,32 +529,51 @@
     // we check for that session first and only fall back to s3 api keys if
     // no session is found.
 
-    // checks for an active archive.org browser session by reading the IA
-    // login cookies via GM_cookie. returns { loggedIn, username }.
-    // if GM_cookie is not available (violentmonkey, safari) returns { loggedIn: false }.
+    // checks for an active archive.org session by reading ia login cookies.
+    // ia sets cookies on archive.org itself (not the web.archive.org subdomain),
+    // so i check both domains and merge the results to be safe.
+    // logs all found cookie names to the console to help debug missing-session issues.
     function getIaLoginStatus() {
         return new Promise(function (resolve) {
             var fallback = { loggedIn: false, username: null };
             try {
                 if (typeof GM_cookie !== 'undefined' && typeof GM_cookie.list === 'function') {
-                    GM_cookie.list({ url: 'https://web.archive.org' }, function (cookies, err) {
-                        if (err || !Array.isArray(cookies)) { resolve(fallback); return; }
-                        // ia sets logged-in-user and logged-in-sig when you log in
-                        var userCookie = null;
-                        var hasSig = false;
-                        cookies.forEach(function (c) {
-                            if (c.name === 'logged-in-user') userCookie = c;
-                            if (c.name === 'logged-in-sig') hasSig = true;
+                    // check archive.org first — login cookies are typically set here
+                    GM_cookie.list({ url: 'https://archive.org' }, function (cookies1, err1) {
+                        var list1 = Array.isArray(cookies1) ? cookies1 : [];
+
+                        // also check web.archive.org in case any are scoped there
+                        GM_cookie.list({ url: 'https://web.archive.org' }, function (cookies2, err2) {
+                            var list2 = Array.isArray(cookies2) ? cookies2 : [];
+
+                            // merge, deduplicating by name (list1 takes priority)
+                            var seen = {};
+                            var all = [];
+                            list1.concat(list2).forEach(function (c) {
+                                if (!seen[c.name]) { seen[c.name] = true; all.push(c); }
+                            });
+
+                            // log what we found so users can debug in the console
+                            console.log('[AO3→Wayback] ia cookies found (' + all.length + '):', all.map(function (c) { return c.name; }).join(', ') || '(none)');
+
+                            // ia login cookies
+                            var userCookie = all.find(function (c) { return c.name === 'logged-in-user'; });
+                            var hasSig     = all.some(function (c) { return c.name === 'logged-in-sig'; });
+
+                            // require at least the user cookie — sig is the ideal
+                            // check but may be absent in some ia account configurations
+                            var loggedIn = !!userCookie;
+                            var username = loggedIn ? decodeURIComponent(userCookie.value) : null;
+                            console.log('[AO3→Wayback] ia login status:', loggedIn, '| user:', username, '| sig present:', hasSig);
+                            resolve({ loggedIn: loggedIn, username: username });
                         });
-                        var loggedIn = !!(userCookie && hasSig);
-                        var username = loggedIn ? decodeURIComponent(userCookie.value) : null;
-                        console.log('[AO3→Wayback] ia session detected:', loggedIn, username);
-                        resolve({ loggedIn: loggedIn, username: username });
                     });
                 } else {
+                    console.log('[AO3→Wayback] GM_cookie not available in this userscript manager');
                     resolve(fallback);
                 }
             } catch (e) {
+                console.warn('[AO3→Wayback] getIaLoginStatus error:', e);
                 resolve(fallback);
             }
         });

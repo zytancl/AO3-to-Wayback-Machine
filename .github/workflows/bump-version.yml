@@ -1,4 +1,4 @@
-name: Auto bump version
+name: auto bump version
 
 # fires when ao3-wayback-machine.user.js is pushed to main.
 # reads the current @version, increments the minor number, writes it

@@ -1,0 +1,69 @@
+name: Release latest build
+
+# runs after bump-version.yml commits the version change.
+# creates (or replaces) a "latest" pre-release on GitHub with the
+# .user.js file attached, so users can see and download it from the
+# releases page in addition to the raw file URL.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ao3-wayback-machine.user.js
+  # allow triggering manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create/delete releases and tags
+
+    # only run on the version-bump commit (so this fires after bump-version.yml
+    # has already incremented the number) or on a manual workflow_dispatch
+    if: |
+      startsWith(github.event.head_commit.message, 'chore: bump version') ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from script
+        id: meta
+        run: |
+          VERSION=$(python3 - << 'PYEOF'
+          import re
+          with open('ao3-wayback-machine.user.js') as f:
+              m = re.search(r'@version\s+(\S+)', f.read())
+          print(m.group(1) if m else 'unknown')
+          PYEOF
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Script version: $VERSION"
+
+      - name: Delete existing latest release and tag
+        # deletes the old "latest" release + its tag so we can recreate it.
+        # || true means the step does not fail if no release exists yet.
+        run: gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create latest pre-release
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          COMMIT_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+
+          gh release create latest \
+            --prerelease \
+            --title "Latest Build — v${{ steps.meta.outputs.version }}" \
+            --notes "Automatic build from the latest commit on \`main\`.
+
+          | | |
+          |---|---|
+          | **Version** | \`${{ steps.meta.outputs.version }}\` |
+          | **Commit** | [\`$SHORT_SHA\`]($COMMIT_URL) |
+
+          Click **ao3-wayback-machine.user.js** below to install or update via Tampermonkey / Violentmonkey." \
+            ao3-wayback-machine.user.js
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

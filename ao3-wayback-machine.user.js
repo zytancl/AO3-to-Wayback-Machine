@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      2.1
+// @version      2.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -32,6 +32,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_cookie
 // @grant        GM_openInTab
+// @grant        GM_notification
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
@@ -114,7 +115,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '3.5',
+            version: '3.6',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -193,37 +194,65 @@
         savePending(items);
     }
 
-    // stores the final archive result (success or error message) so the next
-    // page the user navigates to can show it as a banner.
+    // ── result persistence across page navigation ───────────────────
+    //
+    // two mechanisms work together:
+    //   1. GM_notification (native os popup) — fires immediately when archiving
+    //      completes, survives page navigation, works on desktop
+    //   2. GM_setValue banner — shown on the next page the user navigates to,
+    //      as a fallback for mobile or when GM_notification is unavailable
+    //
+    // the _resultShownLiveThisPage flag prevents double-showing: when archiving
+    // completes on the current page the live banner fires AND storeResult is
+    // called. checkAndShowStoredResult skips showing from storage if the live
+    // banner already ran on this page.
+
     var ARCHIVE_RESULT_KEY = 'ao3wayback_result';
+    var _resultShownLiveThisPage = false;
+
+    function notify(type, message) {
+        // native os notification — persists even after page navigation
+        if (typeof GM_notification === 'function') {
+            try {
+                GM_notification({
+                    title: 'AO3 to Wayback Machine',
+                    text: message,
+                    timeout: 8000,
+                });
+            } catch (_) {}
+        }
+    }
 
     function storeResult(type, message) {
+        // flag so checkAndShowStoredResult won't double-show on the same page
+        _resultShownLiveThisPage = true;
         GM_setValue(ARCHIVE_RESULT_KEY, JSON.stringify({
             type: type,
             message: message,
             timestamp: Date.now(),
         }));
+        // native notification fires immediately and survives page navigation
+        notify(type, message);
     }
 
-    // called at page load to show any result that was written on a previous page.
-    // i compare result.timestamp to _scriptStartTime:
-    //   - result older than this page starting → written on a previous page → show it
-    //   - result newer than this page starting → written on THIS page → skip it
-    //     (the live banner already showed it; no need to double-show)
+    // shows any pending result from the previous page.
+    // skips if the live banner already ran on this page (_resultShownLiveThisPage).
     function checkAndShowStoredResult() {
+        if (_resultShownLiveThisPage) return;
         try {
             var raw = GM_getValue(ARCHIVE_RESULT_KEY, null);
             if (!raw) return;
             var result = JSON.parse(raw);
-            // drop stale results (older than 5 minutes)
-            if (Date.now() - result.timestamp > 300000) {
+            // drop stale results (older than 10 minutes)
+            if (Date.now() - result.timestamp > 600000) {
                 GM_setValue(ARCHIVE_RESULT_KEY, null);
                 return;
             }
-            // only show if the result was written before this page loaded
-            if (result.timestamp >= _scriptStartTime) return;
             GM_setValue(ARCHIVE_RESULT_KEY, null);
-            showBanner(result.message, result.type);
+            // show the banner for longer on cross-page results so the user
+            // has time to notice it after navigating
+            showBanner(result.message, result.type,
+                result.type === 'success' ? 12000 : 20000);
         } catch (_) {}
     }
 
@@ -672,6 +701,12 @@
                 headers: { 'Accept': 'application/json' },
                 timeout: 10000,
                 onload: function (r) {
+                    if (r.status === 429) {
+                        // rate limited on the status poll — back off and retry
+                        console.log('[AO3→Wayback] poll rate limited (429), backing off 60s');
+                        setTimeout(poll, 60000);
+                        return;
+                    }
                     var data;
                     try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
                     console.log('[AO3→Wayback] spn2 job', jobId, 'status:', data.status, data);
@@ -742,6 +777,16 @@
                 data: body,
                 timeout: 30000,
                 onload: function (r) {
+                    if (r.status === 429) {
+                        // wayback is rate-limiting us — need to back off
+                        // longer than the normal retry delay
+                        var retryAfter = 90000;
+                        var msg = 'spn2 rate limited (429) — backing off ' +
+                            (retryAfter / 1000) + 's';
+                        logError('spn2:ratelimit', msg);
+                        reject({ status: 429, msg: msg, retryAfter: retryAfter });
+                        return;
+                    }
                     var data;
                     try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
                     if (data.job_id) {
@@ -832,8 +877,19 @@
                         pollSpn2Job(jobId, url, spn2Done, spn2Fail);
 
                     }, function (err) {
-                        if (attempt <= maxRetries()) {
-                            // submit failed — wait and try with next param set
+                        if (err.status === 429) {
+                            // rate limited — back off and retry regardless of attempt count
+                            var wait = err.retryAfter || 90000;
+                            showBanner(
+                                '⏱ Wayback is rate limiting — waiting ' +
+                                Math.round(wait / 1000) + 's before retry...',
+                                'info', wait + 5000
+                            );
+                            // don't count rate-limit retries against maxRetries()
+                            attempt--;
+                            setTimeout(trySubmit, wait);
+                        } else if (attempt <= maxRetries()) {
+                            // normal failure — try with next param set
                             showBanner(
                                 '🔁 IA API submit failed (attempt ' + attempt + '/' +
                                 (maxRetries() + 1) + ') -- retrying...',

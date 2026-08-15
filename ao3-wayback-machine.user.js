@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them, and fills the bookmark notes field with archive links, author(s), and date. Settings are accessible via the ⚙ button at the bottom-right of any AO3 page.
-// @version      1.10
+// @version      2.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -114,7 +114,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '3.4',
+            version: '3.5',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -515,6 +515,18 @@
     var IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
 
 
+    // cached ia login status — populated once at page load so individual
+    // save calls don't each have to wait for a network round-trip to archive.org.
+    var _iaStatusCache = null;
+
+    function getCachedIaStatus() {
+        if (_iaStatusCache !== null) return Promise.resolve(_iaStatusCache);
+        return getIaLoginStatus().then(function (s) {
+            _iaStatusCache = s;
+            return s;
+        });
+    }
+
     // ── spn2 api (preferred when ia credentials are configured) ──────
     //
     // the wayback machine browser extension works by making the spn2 save
@@ -583,39 +595,50 @@
         });
     }
 
-    // collects all ao3 cookies for the current domain.
-    // document.cookie only gives us non-httpOnly cookies, which misses
-    // _otwarchive_session — the main session token ao3 uses to recognise
-    // logged-in users. GM_cookie (tampermonkey extension API) can read
-    // httpOnly cookies from inside the extension sandbox, so i try that
-    // first and fall back to document.cookie for other managers.
+    // collects ao3 cookies for use as capture_cookie in the spn2 request.
+    // tries GM_cookie first (gets httpOnly _otwarchive_session on tampermonkey)
+    // but falls back to document.cookie after 1.5s if the callback never fires —
+    // on firefox, GM_cookie.list sometimes silently does nothing due to
+    // Total Cookie Protection, which would leave the Promise hanging forever.
     function getAo3Cookies() {
         return new Promise(function (resolve) {
             var fallback = document.cookie;
+            var settled = false;
+
+            function done(val) {
+                if (settled) return;
+                settled = true;
+                resolve(val || fallback);
+            }
+
+            // safety timeout — always resolve within 1.5s
+            setTimeout(function () {
+                if (!settled) {
+                    console.log('[AO3→Wayback] GM_cookie timed out, using document.cookie');
+                    done(fallback);
+                }
+            }, 1500);
 
             try {
                 if (typeof GM_cookie !== 'undefined' &&
                     typeof GM_cookie.list === 'function') {
-
                     GM_cookie.list({}, function (cookies, error) {
                         if (error || !Array.isArray(cookies) || cookies.length === 0) {
-                            console.log('[AO3→Wayback] GM_cookie.list failed or empty, using document.cookie');
-                            resolve(fallback);
+                            done(fallback);
                             return;
                         }
                         var cookieStr = cookies.map(function (c) {
                             return c.name + '=' + c.value;
                         }).join('; ');
                         console.log('[AO3→Wayback] collected', cookies.length, 'cookies via GM_cookie');
-                        resolve(cookieStr || fallback);
+                        done(cookieStr);
                     });
                 } else {
-                    console.log('[AO3→Wayback] GM_cookie not available, using document.cookie');
-                    resolve(fallback);
+                    done(fallback);
                 }
             } catch (e) {
                 console.warn('[AO3→Wayback] GM_cookie error:', e);
-                resolve(fallback);
+                done(fallback);
             }
         });
     }
@@ -757,7 +780,7 @@
     //   3. anonymous — last resort
     function saveViaSPN2(url) {
         return new Promise(function (resolve, reject) {
-            Promise.all([getAo3Cookies(), getIaLoginStatus()]).then(function (res) {
+            Promise.all([getAo3Cookies(), getCachedIaStatus()]).then(function (res) {
                 var ao3Cookies = res[0];
                 var iaStatus   = res[1];
 
@@ -1304,7 +1327,9 @@
             Object.assign(iaStatusBadge.style, {
                 background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a',
             });
-            getIaLoginStatus().then(function (s) { setIaBadge(s.loggedIn, s.username); });
+            // invalidate cache so this always does a fresh check
+            _iaStatusCache = null;
+            getCachedIaStatus().then(function (s) { setIaBadge(s.loggedIn, s.username); });
         }
         checkIaStatus();
 
@@ -1574,6 +1599,13 @@
     }, true);
 
     injectSettingsUI(pageData);
+
+    // pre-warm the ia login status cache so the first save doesn't have to wait.
+    // this runs in the background and doesn't block anything.
+    getCachedIaStatus().then(function (s) {
+        console.log('[AO3→Wayback] ia status pre-warm: loggedIn=' + s.loggedIn +
+            (s.username ? ' user=' + s.username : ''));
+    });
 
     // check for any pending archives left over from previous page
     resumePendingArchives();

@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.1
+// @version      2.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -109,7 +109,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.1',
+            version: '2.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -487,7 +487,26 @@
                         resolve({ url: url, method: 'spn2' });
                     } else if (data.status === 'error') {
                         var reason = data.message || 'unknown';
-                        var is404 = (data.status_ext === 'error:not-found') ||
+                        var statusExt = data.status_ext || '';
+
+                        // transient wayback-side error (503/502) inside the job body.
+                        // this is different from ao3 returning 503 to wayback -- it means
+                        // wayback's own capture infrastructure is temporarily overloaded.
+                        // back off and retry the poll rather than treating it as fatal.
+                        var isTransient503 =
+                            reason.indexOf('503') !== -1 ||
+                            reason.indexOf('502') !== -1 ||
+                            reason.indexOf('No server is available') !== -1 ||
+                            statusExt === 'error:service-unavailable' ||
+                            statusExt === 'error:gateway-timeout';
+                        if (isTransient503 && polls < maxPolls) {
+                            console.log('[AO3→Wayback] job 503/unavailable in body, backing off 60s and retrying poll');
+                            showBanner('Wayback server unavailable -- retrying in 60s...', 'info', 65000);
+                            setTimeout(poll, 60000);
+                            return;
+                        }
+
+                        var is404 = (statusExt === 'error:not-found') ||
                             reason.indexOf('404') !== -1 || reason.indexOf('does not exist') !== -1;
                         var msg = 'spn2 job failed: ' + reason + ' | raw: ' + r.responseText.slice(0, 200);
                         logError('spn2:job-error', msg);

@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.1
+// @version      2.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -109,7 +109,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.1',
+            version: '2.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -470,7 +470,17 @@
                 headers: { 'Accept': 'application/json' },
                 timeout: 10000,
                 onload: function (r) {
-                    if (r.status === 429) { setTimeout(poll, 60000); return; }
+                    if (r.status === 429) {
+                        console.log('[AO3→Wayback] poll rate limited (429), backing off 60s');
+                        setTimeout(poll, 60000);
+                        return;
+                    }
+                    if (r.status === 503 || r.status === 502) {
+                        // ia service temporarily unavailable -- back off and retry poll
+                        console.log('[AO3→Wayback] poll service unavailable (' + r.status + '), backing off 30s');
+                        setTimeout(poll, 30000);
+                        return;
+                    }
                     var data;
                     try { data = JSON.parse(r.responseText); } catch (_) { data = {}; }
                     if (data.status === 'success') {
@@ -507,8 +517,14 @@
                 headers: headers, data: body, timeout: 30000,
                 onload: function (r) {
                     if (r.status === 429) {
-                        logError('spn2:ratelimit', 'rate limited (429)');
-                        reject({ status: 429, msg: 'rate limited', retryAfter: 90000 });
+                        logError('spn2:ratelimit', 'rate limited (429) -- backing off 90s');
+                        reject({ status: 429, msg: 'rate limited (429)', retryAfter: 90000 });
+                        return;
+                    }
+                    if (r.status === 503 || r.status === 502) {
+                        // ia save service temporarily unavailable -- back off and retry
+                        logError('spn2:unavailable', 'service unavailable (' + r.status + ') -- backing off 60s');
+                        reject({ status: r.status, msg: 'service unavailable (' + r.status + ')', retryAfter: 60000, transient: true });
                         return;
                     }
                     var data;
@@ -570,9 +586,12 @@
                         }
                         pollSpn2Job(jobId, url, spn2Done, spn2Fail);
                     }, function (err) {
-                        if (err.status === 429) {
-                            var wait = err.retryAfter || 90000;
-                            showBanner('Wayback rate limiting -- waiting ' + Math.round(wait / 1000) + 's...', 'info', wait + 5000);
+                        if (err.status === 429 || err.transient) {
+                            // transient server error (429 rate limit or 502/503 unavailable)
+                            // -- back off and retry without counting against maxRetries
+                            var wait = err.retryAfter || 60000;
+                            var reason = err.status === 429 ? 'rate limiting' : 'service unavailable (' + err.status + ')';
+                            showBanner('Wayback ' + reason + ' -- waiting ' + Math.round(wait / 1000) + 's before retry...', 'info', wait + 5000);
                             attempt--;
                             setTimeout(trySubmit, wait);
                         } else if (attempt <= maxRetries()) {

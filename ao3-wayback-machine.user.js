@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.1
+// @version      2.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -109,7 +109,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.1',
+            version: '2.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -373,29 +373,49 @@
     function getIaLoginStatus() {
         return new Promise(function (resolve) {
             var fallback = { loggedIn: false, username: null };
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: 'https://archive.org/account/s3.php',
-                timeout: 8000,
-                onload: function (r) {
-                    var finalUrl = r.finalUrl || '';
-                    var loggedIn = r.status === 200 && finalUrl.indexOf('login') === -1;
-                    var username = null;
-                    if (loggedIn) {
-                        var pats = [/"username"\s*:\s*"([^"]+)"/, /logged[- ]in as[^<]*<[^>]+>([^<]+)/i];
-                        for (var i = 0; i < pats.length; i++) {
-                            var m = r.responseText.match(pats[i]);
-                            if (m) { username = m[1].trim(); break; }
+            var settled = false;
+            function done(val) {
+                if (settled) return;
+                settled = true;
+                resolve(val);
+            }
+            // hard timeout — if GM_xmlhttpRequest throws or never calls back,
+            // the promise still resolves so nothing downstream hangs forever
+            var hardTimer = setTimeout(function () {
+                console.warn('[AO3\u2192Wayback] ia auth hard timeout');
+                done(fallback);
+            }, 10000);
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: 'https://archive.org/account/s3.php',
+                    timeout: 8000,
+                    onload: function (r) {
+                        clearTimeout(hardTimer);
+                        var finalUrl = r.finalUrl || '';
+                        var loggedIn = r.status === 200 && finalUrl.indexOf('login') === -1;
+                        var username = null;
+                        if (loggedIn) {
+                            var pats = [/"username"\s*:\s*"([^"]+)"/, /logged[- ]in as[^<]*<[^>]+>([^<]+)/i];
+                            for (var i = 0; i < pats.length; i++) {
+                                var m = r.responseText.match(pats[i]);
+                                if (m) { username = m[1].trim(); break; }
+                            }
                         }
-                    }
-                    console.log('[AO3\u2192Wayback] ia auth: loggedIn=' + loggedIn + ' user=' + username);
-                    resolve({ loggedIn: loggedIn, username: username });
-                },
-                onerror: function () { resolve(fallback); },
-                ontimeout: function () { resolve(fallback); },
-            });
+                        console.log('[AO3\u2192Wayback] ia auth: loggedIn=' + loggedIn + ' user=' + username);
+                        done({ loggedIn: loggedIn, username: username });
+                    },
+                    onerror: function () { clearTimeout(hardTimer); done(fallback); },
+                    ontimeout: function () { clearTimeout(hardTimer); done(fallback); },
+                });
+            } catch (e) {
+                clearTimeout(hardTimer);
+                console.warn('[AO3\u2192Wayback] ia auth GM_xmlhttpRequest threw:', e);
+                done(fallback);
+            }
         });
     }
+
 
 
     // ================================================================
@@ -571,7 +591,31 @@
 
     function saveViaSPN2(url) {
         return new Promise(function (resolve, reject) {
+            // safety: if either promise hangs somehow, force a timeout so we
+            // don't block the save indefinitely
+            var spn2Started = false;
+            setTimeout(function () {
+                if (!spn2Started) {
+                    console.warn('[AO3→Wayback] spn2 Promise.all timed out, retrying with defaults');
+                    spn2Started = true;
+                    // try without waiting for cookies or ia status
+                    var headers = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };
+                    if (settings.iaAccessKey && settings.iaSecretKey) {
+                        headers['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
+                    }
+                    submitSpn2(url, '', headers).then(function (jobId) {
+                        addPendingItem({ type: 'spn2', jobId: jobId, url: url, startedAt: Date.now() });
+                        pollSpn2Job(jobId, url,
+                            function (r) { removePendingItem('spn2', jobId); resolve(r); },
+                            function (e) { removePendingItem('spn2', jobId); reject(e); }
+                        );
+                    }, reject);
+                }
+            }, 4000);
+
             Promise.all([getAo3Cookies(), getCachedIaStatus()]).then(function (res) {
+                if (spn2Started) return; // timeout already fired, skip
+                spn2Started = true;
                 var ao3Cookies = res[0];
                 var iaStatus = res[1];
                 var headers = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };

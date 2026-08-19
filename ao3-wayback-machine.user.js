@@ -123,7 +123,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.1',
+            version: '4.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -1140,57 +1140,50 @@
     // init
     // ================================================================
 
-    // the @match now covers all ao3 pages so banners appear anywhere the user
-    // navigates after bookmarking. but the heavy logic -- page data collection,
-    // bookmark form watcher, archiving -- only runs on work and series pages.
-    var _path = window.location.pathname;
-    var isArchivablePage = /\/(works|series)\/\d+/.test(_path) ||
-        /\/collections\/[^/]+\/works\/\d+/.test(_path);
+    // init — script only runs on work/series pages (specific @match patterns),
+    // so no page-type gating needed here
+    var pageData = collectPageData();
 
-    var pageData = isArchivablePage ? collectPageData() : null;
+    var onNodeAdded = function (node) {
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        var field = node.id === 'bookmark_notes'
+            ? node
+            : (node.querySelector ? node.querySelector('#bookmark_notes') : null);
+        if (field) injectBookmarkNote(pageData);
+    };
 
-    if (isArchivablePage && pageData) {
-        function onNodeAdded(node) {
-            if (node.nodeType !== Node.ELEMENT_NODE) return;
-            var field = node.id === 'bookmark_notes'
-                ? node
-                : (node.querySelector ? node.querySelector('#bookmark_notes') : null);
-            if (field) injectBookmarkNote(pageData);
-        }
+    var observer = new MutationObserver(function (mutations) {
+        mutations.forEach(function (mut) { mut.addedNodes.forEach(onNodeAdded); });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
 
-        var observer = new MutationObserver(function (mutations) {
-            mutations.forEach(function (mut) { mut.addedNodes.forEach(onNodeAdded); });
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-
-        if (document.getElementById('bookmark_notes')) {
-            injectBookmarkNote(pageData);
-        }
-
-        window.addEventListener('submit', function (e) {
-            var form = e.target;
-            if (!form || !form.action) return;
-            var isBookmarkForm =
-                /\/bookmarks/.test(form.action) ||
-                form.id === 'new_bookmark' ||
-                form.classList.contains('bookmark-form');
-            if (isBookmarkForm && pageData.urls.size > 0) {
-                console.log('[AO3\u2192Wayback] bookmark form submitted, archiving', pageData.urls.size, 'url(s)');
-                archiveAll(pageData.urls);
-            }
-        }, true);
+    if (document.getElementById('bookmark_notes')) {
+        injectBookmarkNote(pageData);
     }
+
+    window.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || !form.action) return;
+        var isBookmarkForm =
+            /\/bookmarks/.test(form.action) ||
+            form.id === 'new_bookmark' ||
+            form.classList.contains('bookmark-form');
+        if (isBookmarkForm && pageData.urls.size > 0) {
+            console.log('[AO3\u2192Wayback] bookmark form submitted, archiving', pageData.urls.size, 'url(s)');
+            archiveAll(pageData.urls);
+        }
+    }, true);
 
     injectSettingsUI(pageData);
 
-    // pre-warm the ia login status cache in the background
+    // pre-warm ia login status cache in the background
     getCachedIaStatus().then(function (s) {
         console.log('[AO3\u2192Wayback] ia status: loggedIn=' + s.loggedIn + (s.username ? ' user=' + s.username : ''));
     });
 
     resumePendingArchives();
 
-    // show any result banner from the previous page after 100ms
+    // show any result banner carried over from the previous page
     setTimeout(checkAndShowStoredResult, 100);
 
 })();

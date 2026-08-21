@@ -43,6 +43,8 @@
     'use strict';
 // this file is appended to the header already written
 
+    console.log('[AO3\u2192Wayback] script loaded on:', window.location.href);
+
     // Promise.allSettled polyfill
     if (typeof Promise.allSettled !== 'function') {
         Promise.allSettled = function (promises) {
@@ -747,15 +749,23 @@
     }
 
     function saveToWayback(url) {
-        if (settings.iaAccessKey && settings.iaSecretKey) return saveViaSPN2(url);
-        if (_iaStatusCache && _iaStatusCache.loggedIn) return saveViaSPN2(url);
+        if (settings.iaAccessKey && settings.iaSecretKey) {
+            console.log('[AO3\u2192Wayback] saveToWayback -> spn2 (api keys) for:', url);
+            return saveViaSPN2(url);
+        }
+        if (_iaStatusCache && _iaStatusCache.loggedIn) {
+            console.log('[AO3\u2192Wayback] saveToWayback -> spn2 (session) for:', url);
+            return saveViaSPN2(url);
+        }
+        console.log('[AO3\u2192Wayback] saveToWayback -> tab method for:', url);
         return saveViaTab(url);
     }
 
     var _hasRun = false;
 
     function archiveAll(urls) {
-        if (_hasRun) return;
+        console.log('[AO3\u2192Wayback] archiveAll called | _hasRun:', _hasRun, '| urls.size:', urls ? urls.size : 'null');
+        if (_hasRun) { console.log('[AO3\u2192Wayback] archiveAll blocked by _hasRun'); return; }
         _hasRun = true;
         setTimeout(function () { _hasRun = false; }, 5000);
 
@@ -1163,13 +1173,15 @@
 
     window.addEventListener('submit', function (e) {
         var form = e.target;
+        console.log('[AO3\u2192Wayback] form submit detected | action:', (form && form.action) || '(none)', '| id:', (form && form.id) || '(none)');
         if (!form || !form.action) return;
         var isBookmarkForm =
             /\/bookmarks/.test(form.action) ||
             form.id === 'new_bookmark' ||
             form.classList.contains('bookmark-form');
-        if (isBookmarkForm && pageData.urls.size > 0) {
-            console.log('[AO3\u2192Wayback] bookmark form submitted, archiving', pageData.urls.size, 'url(s)');
+        console.log('[AO3\u2192Wayback] isBookmarkForm:', isBookmarkForm, '| urls.size:', pageData ? pageData.urls.size : 'NO PAGEDATA');
+        if (isBookmarkForm && pageData && pageData.urls.size > 0) {
+            console.log('[AO3\u2192Wayback] calling archiveAll');
             archiveAll(pageData.urls);
         }
     }, true);

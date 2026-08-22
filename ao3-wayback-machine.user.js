@@ -125,7 +125,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '4.0',
+            version: '2.1',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -251,7 +251,12 @@
     // ================================================================
 
     function collectPageData() {
-        var href = window.location.href;
+        // strip the hash fragment (e.g. #bookmark-form) before processing.
+        // ao3 adds #bookmark-form to the url when the inline bookmark form is
+        // shown. without this, the fragment ends up in the archived url as
+        // /works/12345#bookmark-form?view_adult=true which is invalid and
+        // causes wayback to get a 404 from ao3.
+        var href = window.location.href.split('#')[0];
         var isSeries = /\/series\/\d+/.test(href);
         var series = null;
         var works = [];

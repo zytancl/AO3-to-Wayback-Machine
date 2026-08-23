@@ -2,31 +2,45 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.1
+// @version      2.2
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @match        https://archiveofourown.org/works/*
 // @match        https://archiveofourown.org/series/*
 // @match        https://archiveofourown.org/collections/*/works/*
+// @match        https://archiveofourown.org/bookmarks/*
+// @match        https://archiveofourown.org/users/*
 // @match        https://archiveofourown.com/works/*
 // @match        https://archiveofourown.com/series/*
 // @match        https://archiveofourown.com/collections/*/works/*
+// @match        https://archiveofourown.com/bookmarks/*
+// @match        https://archiveofourown.com/users/*
 // @match        https://archiveofourown.net/works/*
 // @match        https://archiveofourown.net/series/*
 // @match        https://archiveofourown.net/collections/*/works/*
+// @match        https://archiveofourown.net/bookmarks/*
+// @match        https://archiveofourown.net/users/*
 // @match        https://archiveofourown.gay/works/*
 // @match        https://archiveofourown.gay/series/*
 // @match        https://archiveofourown.gay/collections/*/works/*
+// @match        https://archiveofourown.gay/bookmarks/*
+// @match        https://archiveofourown.gay/users/*
 // @match        https://ao3.org/works/*
 // @match        https://ao3.org/series/*
 // @match        https://ao3.org/collections/*/works/*
+// @match        https://ao3.org/bookmarks/*
+// @match        https://ao3.org/users/*
 // @match        https://archive.transformativeworks.org/works/*
 // @match        https://archive.transformativeworks.org/series/*
 // @match        https://archive.transformativeworks.org/collections/*/works/*
+// @match        https://archive.transformativeworks.org/bookmarks/*
+// @match        https://archive.transformativeworks.org/users/*
 // @match        http://insecure.archiveofourown.org/works/*
 // @match        http://insecure.archiveofourown.org/series/*
 // @match        http://insecure.archiveofourown.org/collections/*/works/*
+// @match        http://insecure.archiveofourown.org/bookmarks/*
+// @match        http://insecure.archiveofourown.org/users/*
 // @connect      web.archive.org
 // @connect      archive.org
 // @grant        GM_xmlhttpRequest
@@ -125,7 +139,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.1',
+            version: '2.2',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -836,6 +850,37 @@
                     },
                     function (err) {
                         removePendingItem('spn2', item.jobId);
+                        // if ao3 returned 404 to wayback, try once more with
+                        // the base url (no view params) before giving up
+                        if (err.is404) {
+                            var baseUrl = item.url.split('?')[0];
+                            if (baseUrl !== item.url) {
+                                logError('resume:spn2:retry-base', 'got 404, trying base url: ' + baseUrl);
+                                var hdrs = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };
+                                if (settings.iaAccessKey && settings.iaSecretKey) {
+                                    hdrs['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
+                                }
+                                submitSpn2(baseUrl, '', hdrs).then(function (jobId2) {
+                                    // don't add to pending — this is a one-shot retry
+                                    pollSpn2Job(jobId2, baseUrl,
+                                        function () {
+                                            var m = 'Archived to the Wayback Machine (base url).';
+                                            showBanner(m, 'success'); storeResult('success', m);
+                                        },
+                                        function (e2) {
+                                            logError('resume:spn2', String(e2));
+                                            var m = 'Archive failed (AO3 is blocking Wayback). Open settings for error log.';
+                                            showBanner(m, 'error', 10000); storeResult('error', m);
+                                        }
+                                    );
+                                }, function (e2) {
+                                    logError('resume:spn2', String(e2));
+                                    var m = 'Archive failed. Open settings for error log.';
+                                    showBanner(m, 'error', 10000); storeResult('error', m);
+                                });
+                                return;
+                            }
+                        }
                         logError('resume:spn2', String(err));
                         var m = 'Archive failed. Open settings for error log.';
                         showBanner(m, 'error', 10000); storeResult('error', m);
@@ -1155,41 +1200,48 @@
     // init
     // ================================================================
 
-    // init — script only runs on work/series pages (specific @match patterns),
-    // so no page-type gating needed here
-    var pageData = collectPageData();
+    // init
+    // use pathname (never contains the hash fragment) to detect page type.
+    // bookmarks and users pages are in @match so the banner can show there,
+    // but the archiving logic (observer, submit listener) only runs on
+    // work and series pages.
+    var _pathname = window.location.pathname;
+    var isArchivePage = /\/(works|series)\/\d+/.test(_pathname) ||
+        /\/collections\/[^/]+\/works\/\d+/.test(_pathname);
 
-    var onNodeAdded = function (node) {
-        if (node.nodeType !== Node.ELEMENT_NODE) return;
-        var field = node.id === 'bookmark_notes'
-            ? node
-            : (node.querySelector ? node.querySelector('#bookmark_notes') : null);
-        if (field) injectBookmarkNote(pageData);
-    };
+    var pageData = isArchivePage ? collectPageData() : null;
 
-    var observer = new MutationObserver(function (mutations) {
-        mutations.forEach(function (mut) { mut.addedNodes.forEach(onNodeAdded); });
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    if (isArchivePage && pageData) {
+        var onNodeAdded = function (node) {
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            var field = node.id === 'bookmark_notes'
+                ? node
+                : (node.querySelector ? node.querySelector('#bookmark_notes') : null);
+            if (field) injectBookmarkNote(pageData);
+        };
 
-    if (document.getElementById('bookmark_notes')) {
-        injectBookmarkNote(pageData);
-    }
+        var observer = new MutationObserver(function (mutations) {
+            mutations.forEach(function (mut) { mut.addedNodes.forEach(onNodeAdded); });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
 
-    window.addEventListener('submit', function (e) {
-        var form = e.target;
-        console.log('[AO3\u2192Wayback] form submit detected | action:', (form && form.action) || '(none)', '| id:', (form && form.id) || '(none)');
-        if (!form || !form.action) return;
-        var isBookmarkForm =
-            /\/bookmarks/.test(form.action) ||
-            form.id === 'new_bookmark' ||
-            form.classList.contains('bookmark-form');
-        console.log('[AO3\u2192Wayback] isBookmarkForm:', isBookmarkForm, '| urls.size:', pageData ? pageData.urls.size : 'NO PAGEDATA');
-        if (isBookmarkForm && pageData && pageData.urls.size > 0) {
-            console.log('[AO3\u2192Wayback] calling archiveAll');
-            archiveAll(pageData.urls);
+        if (document.getElementById('bookmark_notes')) {
+            injectBookmarkNote(pageData);
         }
-    }, true);
+
+        window.addEventListener('submit', function (e) {
+            var form = e.target;
+            if (!form || !form.action) return;
+            var isBookmarkForm =
+                /\/bookmarks/.test(form.action) ||
+                form.id === 'new_bookmark' ||
+                form.classList.contains('bookmark-form');
+            if (isBookmarkForm && pageData.urls.size > 0) {
+                console.log('[AO3\u2192Wayback] bookmark form submitted, archiving', pageData.urls.size, 'url(s)');
+                archiveAll(pageData.urls);
+            }
+        }, true);
+    }
 
     injectSettingsUI(pageData);
 
@@ -1200,7 +1252,9 @@
 
     resumePendingArchives();
 
-    // show any result banner carried over from the previous page
+    // show any result banner carried over from the previous page.
+    // now that @match includes /bookmarks/* and /users/*, this fires on
+    // the page ao3 redirects to after a bookmark is saved.
     setTimeout(checkAndShowStoredResult, 100);
 
 })();

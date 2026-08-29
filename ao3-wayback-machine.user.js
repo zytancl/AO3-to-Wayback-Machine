@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.2
+// @version      2.3
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -120,6 +120,14 @@
         console.warn('[AO3\u2192Wayback]', context, detail);
     }
 
+    // logWarn is for expected failures (e.g. ao3 blocking wayback with 404).
+    // these appear in the console but NOT in the exported error log, so they
+    // don't confuse users into thinking there is a script bug.
+    function logWarn(context, detail) {
+        console.info('[AO3→Wayback] [info]', context, detail);
+    }
+
+
     function fallbackCopyLog(text) {
         var ta = document.createElement('textarea');
         ta.value = text;
@@ -139,7 +147,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.2',
+            version: '2.3',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -564,7 +572,12 @@
                         var is404 = (statusExt === 'error:not-found') ||
                             reason.indexOf('404') !== -1 || reason.indexOf('does not exist') !== -1;
                         var msg = 'spn2 job failed: ' + reason + ' | raw: ' + r.responseText.slice(0, 200);
-                        logError('spn2:job-error', msg);
+                        // 404 means ao3 blocked wayback's crawler -- expected, not a script bug
+                        if (is404) {
+                            logWarn('spn2:job-404', msg);
+                        } else {
+                            logError('spn2:job-error', msg);
+                        }
                         var err = new Error(msg);
                         err.is404 = is404;
                         reject(err);
@@ -855,7 +868,8 @@
                         if (err.is404) {
                             var baseUrl = item.url.split('?')[0];
                             if (baseUrl !== item.url) {
-                                logError('resume:spn2:retry-base', 'got 404, trying base url: ' + baseUrl);
+                                // 404 is expected -- ao3 blocks wayback; log as info not error
+                                logWarn('resume:spn2:retry-base', 'got 404, trying base url: ' + baseUrl);
                                 var hdrs = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };
                                 if (settings.iaAccessKey && settings.iaSecretKey) {
                                     hdrs['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
@@ -868,8 +882,9 @@
                                             showBanner(m, 'success'); storeResult('success', m);
                                         },
                                         function (e2) {
-                                            logError('resume:spn2', String(e2));
-                                            var m = 'Archive failed (AO3 is blocking Wayback). Open settings for error log.';
+                                            // both url variants got 404 -- ao3 is blocking wayback for this work
+                                            logWarn('resume:spn2:blocked', String(e2));
+                                            var m = 'AO3 is blocking Wayback for this work (404). Nothing the script can do.';
                                             showBanner(m, 'error', 10000); storeResult('error', m);
                                         }
                                     );
@@ -881,8 +896,14 @@
                                 return;
                             }
                         }
-                        logError('resume:spn2', String(err));
-                        var m = 'Archive failed. Open settings for error log.';
+                        // if is404, ao3 is blocking wayback -- not a script error
+                        if (err.is404) {
+                            logWarn('resume:spn2:blocked', String(err));
+                            var m = 'AO3 is blocking Wayback for this work (404). Nothing the script can do.';
+                        } else {
+                            logError('resume:spn2', String(err));
+                            var m = 'Archive failed. Open settings for error log.';
+                        }
                         showBanner(m, 'error', 10000); storeResult('error', m);
                     }
                 );

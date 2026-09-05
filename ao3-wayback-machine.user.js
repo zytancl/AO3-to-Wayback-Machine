@@ -43,6 +43,7 @@
 // @match        http://insecure.archiveofourown.org/users/*
 // @connect      web.archive.org
 // @connect      archive.org
+// @connect      archive.ph
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
 // @grant        GM_notification
@@ -569,17 +570,31 @@
                             return;
                         }
 
-                        var is404 = (statusExt === 'error:not-found') ||
-                            reason.indexOf('404') !== -1 || reason.indexOf('does not exist') !== -1;
+                        var is404 = statusExt === 'error:not-found' ||
+                            reason.indexOf('404') !== -1 ||
+                            reason.indexOf('does not exist') !== -1;
+                        // ao3 also drops the tcp connection entirely (no response),
+                        // which wayback reports as a connection error rather than 404.
+                        // treat it the same way -- retry with simpler url.
+                        var isConnectionError =
+                            reason.indexOf('does not respond') !== -1 ||
+                            reason.indexOf('connect refused') !== -1 ||
+                            reason.indexOf('connection refused') !== -1 ||
+                            statusExt === 'error:connection-refused' ||
+                            statusExt === 'error:connection-failed' ||
+                            statusExt === 'error:read-timeout' ||
+                            statusExt === 'error:timeout';
+                        var isBlocked = is404 || isConnectionError;
                         var msg = 'spn2 job failed: ' + reason + ' | raw: ' + r.responseText.slice(0, 200);
-                        // 404 means ao3 blocked wayback's crawler -- expected, not a script bug
-                        if (is404) {
-                            logWarn('spn2:job-404', msg);
+                        // ao3 blocking wayback is expected -- log as info, not error
+                        if (isBlocked) {
+                            logWarn('spn2:job-blocked', msg);
                         } else {
                             logError('spn2:job-error', msg);
                         }
                         var err = new Error(msg);
                         err.is404 = is404;
+                        err.isBlocked = isBlocked;
                         reject(err);
                     } else if (polls < maxPolls) {
                         setTimeout(poll, 5000);
@@ -688,8 +703,11 @@
                         function spn2Done(r) { removePendingItem('spn2', jobId); resolve(r); }
                         function spn2Fail(e) {
                             removePendingItem('spn2', jobId);
-                            if (e.is404 && attempt <= maxRetries()) {
-                                showBanner('AO3 blocked Wayback (404). Retrying with simpler url...', 'info', retryDelayMs() + 5000);
+                            // retry on any ao3 blocking (404 or connection dropped)
+                            if (e.isBlocked && attempt <= maxRetries()) {
+                                var r2 = e.is404 ? '404' : 'server did not respond';
+                                console.log('[AO3→Wayback] blocked (' + r2 + '), retrying with simpler url (attempt ' + attempt + ')');
+                                showBanner('AO3 blocked Wayback (' + r2 + '). Retrying...', 'info', retryDelayMs() + 5000);
                                 setTimeout(trySubmit, retryDelayMs());
                             } else {
                                 reject(e);
@@ -780,18 +798,53 @@
         });
     }
 
-    function saveToWayback(url) {
-        if (settings.iaAccessKey && settings.iaSecretKey) {
-            console.log('[AO3\u2192Wayback] saveToWayback -> spn2 (api keys) for:', url);
-            return saveViaSPN2(url);
-        }
-        if (_iaStatusCache && _iaStatusCache.loggedIn) {
-            console.log('[AO3\u2192Wayback] saveToWayback -> spn2 (session) for:', url);
-            return saveViaSPN2(url);
-        }
-        console.log('[AO3\u2192Wayback] saveToWayback -> tab method for:', url);
-        return saveViaTab(url);
+    // opens an archive.today submission tab for a url.
+    // used as a last-resort fallback when wayback is blocked by ao3 at the
+    // ip/network level. archive.today uses different crawling infrastructure
+    // and is generally not blocked by ao3 the same way wayback is.
+    function saveViaArchiveToday(url) {
+        return new Promise(function (resolve, reject) {
+            var baseUrl = url.split('?')[0];
+            var atUrl = 'https://archive.ph/submit/?url=' + encodeURIComponent(baseUrl);
+            showBanner('Wayback blocked by AO3 -- trying archive.today as fallback' +
+                (IS_TOUCH ? ' (check new tab)' : '') + '...', 'info', 30000);
+            console.log('[AO3→Wayback] trying archive.today:', atUrl);
+            try {
+                GM_openInTab(atUrl, { active: IS_TOUCH, insert: true });
+                setTimeout(function () {
+                    resolve({ url: baseUrl, method: 'archive.today' });
+                }, 3000);
+            } catch (e) {
+                logError('archive.today', String(e));
+                reject(new Error('archive.today fallback failed: ' + String(e)));
+            }
+        });
     }
+
+    function saveToWayback(url) {
+        var useSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey) ||
+            !!(_iaStatusCache && _iaStatusCache.loggedIn);
+
+        if (useSPN2) {
+            console.log('[AO3→Wayback] saveToWayback -> spn2 for:', url);
+            return saveViaSPN2(url).then(null, function (err) {
+                if (err && err.isBlocked) {
+                    // all spn2 attempts blocked by ao3 -- fall back to archive.today
+                    console.log('[AO3→Wayback] spn2 fully blocked, falling back to archive.today');
+                    return saveViaArchiveToday(url);
+                }
+                return Promise.reject(err);
+            });
+        }
+
+        console.log('[AO3→Wayback] saveToWayback -> tab method for:', url);
+        return saveViaTab(url).then(null, function () {
+            // tab method failed -- also try archive.today
+            console.log('[AO3→Wayback] tab method failed, falling back to archive.today');
+            return saveViaArchiveToday(url);
+        });
+    }
+
 
     var _hasRun = false;
 
@@ -865,11 +918,12 @@
                         removePendingItem('spn2', item.jobId);
                         // if ao3 returned 404 to wayback, try once more with
                         // the base url (no view params) before giving up
-                        if (err.is404) {
+                        if (err.isBlocked) {
                             var baseUrl = item.url.split('?')[0];
                             if (baseUrl !== item.url) {
-                                // 404 is expected -- ao3 blocks wayback; log as info not error
-                                logWarn('resume:spn2:retry-base', 'got 404, trying base url: ' + baseUrl);
+                                // ao3 blocking wayback -- log as info, try base url
+                                var blockReason = err.is404 ? '404' : 'server did not respond';
+                                logWarn('resume:spn2:retry-base', 'got ' + blockReason + ', trying base url: ' + baseUrl);
                                 var hdrs = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };
                                 if (settings.iaAccessKey && settings.iaSecretKey) {
                                     hdrs['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
@@ -896,10 +950,10 @@
                                 return;
                             }
                         }
-                        // if is404, ao3 is blocking wayback -- not a script error
-                        if (err.is404) {
+                        // ao3 blocking wayback (404 or no response) -- not a script error
+                        if (err.isBlocked) {
                             logWarn('resume:spn2:blocked', String(err));
-                            var m = 'AO3 is blocking Wayback for this work (404). Nothing the script can do.';
+                            var m = 'AO3 is blocking Wayback for this work. Nothing the script can do.';
                         } else {
                             logError('resume:spn2', String(err));
                             var m = 'Archive failed. Open settings for error log.';

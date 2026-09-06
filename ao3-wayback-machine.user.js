@@ -821,29 +821,34 @@
         });
     }
 
+    // always awaits getCachedIaStatus() before deciding which method to use.
+    // reading _iaStatusCache directly at call time fails when the user submits
+    // the bookmark form before the 10s pre-warm has completed -- the cache is
+    // still null, useSPN2 evaluates to false, and the tab method is used instead
+    // of spn2, which opens a wayback tab that shows "server does not respond".
     function saveToWayback(url) {
-        var useSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey) ||
-            !!(_iaStatusCache && _iaStatusCache.loggedIn);
+        return getCachedIaStatus().then(function (iaStatus) {
+            var useSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey) || iaStatus.loggedIn;
 
-        if (useSPN2) {
-            console.log('[AO3→Wayback] saveToWayback -> spn2 for:', url);
-            return saveViaSPN2(url).then(null, function (err) {
-                if (err && err.isBlocked) {
-                    // all spn2 attempts blocked by ao3 -- fall back to archive.today
-                    console.log('[AO3→Wayback] spn2 fully blocked, falling back to archive.today');
-                    return saveViaArchiveToday(url);
-                }
-                return Promise.reject(err);
+            if (useSPN2) {
+                console.log('[AO3→Wayback] saveToWayback -> spn2 for:', url);
+                return saveViaSPN2(url).then(null, function (err) {
+                    if (err && err.isBlocked) {
+                        console.log('[AO3→Wayback] spn2 fully blocked, falling back to archive.today');
+                        return saveViaArchiveToday(url);
+                    }
+                    return Promise.reject(err);
+                });
+            }
+
+            console.log('[AO3→Wayback] saveToWayback -> tab method for:', url);
+            return saveViaTab(url).then(null, function () {
+                console.log('[AO3→Wayback] tab method failed, falling back to archive.today');
+                return saveViaArchiveToday(url);
             });
-        }
-
-        console.log('[AO3→Wayback] saveToWayback -> tab method for:', url);
-        return saveViaTab(url).then(null, function () {
-            // tab method failed -- also try archive.today
-            console.log('[AO3→Wayback] tab method failed, falling back to archive.today');
-            return saveViaArchiveToday(url);
         });
     }
+
 
 
     var _hasRun = false;

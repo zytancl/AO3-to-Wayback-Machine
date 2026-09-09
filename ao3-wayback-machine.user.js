@@ -573,9 +573,15 @@
                         var is404 = statusExt === 'error:not-found' ||
                             reason.indexOf('404') !== -1 ||
                             reason.indexOf('does not exist') !== -1;
-                        // ao3 also drops the tcp connection entirely (no response),
-                        // which wayback reports as a connection error rather than 404.
-                        // treat it the same way -- retry with simpler url.
+                        // ao3 blocks wayback in several ways -- all treated the same:
+                        //   404  : "page not found" returned to crawler
+                        //   403  : "blocks access" (error:no-request) returned to crawler
+                        //   no response: tcp connection dropped before http response
+                        var isAccessBlocked =
+                            reason.indexOf('403') !== -1 ||
+                            reason.indexOf('blocks access') !== -1 ||
+                            statusExt === 'error:no-request' ||
+                            statusExt === 'error:forbidden';
                         var isConnectionError =
                             reason.indexOf('does not respond') !== -1 ||
                             reason.indexOf('connect refused') !== -1 ||
@@ -584,7 +590,7 @@
                             statusExt === 'error:connection-failed' ||
                             statusExt === 'error:read-timeout' ||
                             statusExt === 'error:timeout';
-                        var isBlocked = is404 || isConnectionError;
+                        var isBlocked = is404 || isAccessBlocked || isConnectionError;
                         var msg = 'spn2 job failed: ' + reason + ' | raw: ' + r.responseText.slice(0, 200);
                         // ao3 blocking wayback is expected -- log as info, not error
                         if (isBlocked) {

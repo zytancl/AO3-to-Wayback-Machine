@@ -580,8 +580,12 @@
                         var isAccessBlocked =
                             reason.indexOf('403') !== -1 ||
                             reason.indexOf('blocks access') !== -1 ||
+                            reason.indexOf('could not capture') !== -1 ||
+                            reason.indexOf('blocking access') !== -1 ||
                             statusExt === 'error:no-request' ||
-                            statusExt === 'error:forbidden';
+                            statusExt === 'error:forbidden' ||
+                            statusExt === 'error:no-captures' ||
+                            statusExt === 'error:blocked';
                         var isConnectionError =
                             reason.indexOf('does not respond') !== -1 ||
                             reason.indexOf('connect refused') !== -1 ||
@@ -947,10 +951,18 @@
                                             showBanner(m, 'success'); storeResult('success', m);
                                         },
                                         function (e2) {
-                                            // both url variants got 404 -- ao3 is blocking wayback for this work
+                                            // base url also blocked -- fall back to archive.today
                                             logWarn('resume:spn2:blocked', String(e2));
-                                            var m = 'AO3 is blocking Wayback for this work (404). Nothing the script can do.';
-                                            showBanner(m, 'error', 10000); storeResult('error', m);
+                                            saveViaArchiveToday(item.url).then(
+                                                function () {
+                                                    var m = 'Wayback blocked -- archived via archive.today instead.';
+                                                    showBanner(m, 'success'); storeResult('success', m);
+                                                },
+                                                function () {
+                                                    var m = 'AO3 is blocking all archiving services. Nothing the script can do.';
+                                                    showBanner(m, 'error', 10000); storeResult('error', m);
+                                                }
+                                            );
                                         }
                                     );
                                 }, function (e2) {
@@ -961,15 +973,25 @@
                                 return;
                             }
                         }
-                        // ao3 blocking wayback (404 or no response) -- not a script error
+                        // ao3 blocking wayback -- not a script error
                         if (err.isBlocked) {
                             logWarn('resume:spn2:blocked', String(err));
-                            var m = 'AO3 is blocking Wayback for this work. Nothing the script can do.';
+                            // try archive.today as final fallback
+                            saveViaArchiveToday(item.url).then(
+                                function () {
+                                    var m = 'Wayback blocked -- archived via archive.today instead.';
+                                    showBanner(m, 'success'); storeResult('success', m);
+                                },
+                                function () {
+                                    var m = 'AO3 is blocking all archiving services. Nothing the script can do.';
+                                    showBanner(m, 'error', 10000); storeResult('error', m);
+                                }
+                            );
                         } else {
                             logError('resume:spn2', String(err));
                             var m = 'Archive failed. Open settings for error log.';
+                            showBanner(m, 'error', 10000); storeResult('error', m);
                         }
-                        showBanner(m, 'error', 10000); storeResult('error', m);
                     }
                 );
             } else if (item.type === 'tab') {

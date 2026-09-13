@@ -655,8 +655,10 @@
                     reject({ status: 0, msg: msg });
                 },
                 ontimeout: function () {
-                    logError('spn2:timeout', 'submit timed out');
-                    reject({ status: 0, msg: 'submit timed out' });
+                    // wayback submit timeout -- usually means the save endpoint is
+                    // temporarily overloaded (503). treat as transient and back off.
+                    logWarn('spn2:submit-timeout', 'submit timed out -- wayback may be overloaded');
+                    reject({ status: 0, msg: 'submit timed out', transient: true, retryAfter: 90000 });
                 },
             });
         });
@@ -726,11 +728,22 @@
                         pollSpn2Job(jobId, url, spn2Done, spn2Fail);
                     }, function (err) {
                         if (err.status === 429 || err.transient) {
-                            // transient server error (429 rate limit or 502/503 unavailable)
-                            // -- back off and retry without counting against maxRetries
-                            var wait = err.retryAfter || 60000;
-                            var reason = err.status === 429 ? 'rate limiting' : 'service unavailable (' + err.status + ')';
-                            showBanner('Wayback ' + reason + ' -- waiting ' + Math.round(wait / 1000) + 's before retry...', 'info', wait + 5000);
+                            // transient error (429/503 rate limit or submit timeout)
+                            var wait = err.retryAfter || 90000;
+                            var tReason = err.status === 429 ? 'rate limiting'
+                                : err.msg && err.msg.indexOf('timed out') !== -1
+                                    ? 'overloaded (timeout)'
+                                    : 'service unavailable (' + err.status + ')';
+                            if (transientRetries >= MAX_TRANSIENT) {
+                                // too many transient failures -- fall back to archive.today
+                                console.log('[AO3→Wayback] too many transient failures, trying archive.today');
+                                saveViaArchiveToday(url).then(resolve, function () {
+                                    reject(new Error('Wayback overloaded and archive.today fallback failed'));
+                                });
+                                return;
+                            }
+                            transientRetries++;
+                            showBanner('Wayback ' + tReason + ' -- waiting ' + Math.round(wait / 1000) + 's before retry...', 'info', wait + 5000);
                             attempt--;
                             setTimeout(trySubmit, wait);
                         } else if (attempt <= maxRetries()) {

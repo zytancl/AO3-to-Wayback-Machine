@@ -2,7 +2,7 @@
 // @name         AO3 to Wayback Machine
 // @namespace    ao3-wayback-machine
 // @description  Automatically saves AO3 fics to the Internet Archive Wayback Machine when you bookmark them.
-// @version      2.3
+// @version      3.0
 // @author       zytancl
 // @downloadURL  https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
 // @updateURL    https://raw.githubusercontent.com/zytancl/AO3-to-Wayback-Machine/main/ao3-wayback-machine.user.js
@@ -44,6 +44,9 @@
 // @connect      web.archive.org
 // @connect      archive.org
 // @connect      archive.ph
+// @connect      archive.today
+// @connect      archive.is
+// @connect      archive.md
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
 // @grant        GM_notification
@@ -148,7 +151,7 @@
     function exportErrorLog() {
         var text = JSON.stringify({
             script: 'AO3 to Wayback Machine',
-            version: '2.3',
+            version: '3.0',
             userAgent: navigator.userAgent,
             exportedAt: new Date().toISOString(),
             errors: _errorLog,
@@ -699,6 +702,9 @@
                 } else if (settings.iaAccessKey && settings.iaSecretKey) {
                     headers['Authorization'] = 'LOW ' + settings.iaAccessKey + ':' + settings.iaSecretKey;
                 }
+                var transientRetries = 0;
+                var MAX_TRANSIENT = 3;
+
                 var baseParams = ao3Cookies ? 'capture_cookie=' + encodeURIComponent(ao3Cookies) : '';
                 var authMode = iaStatus.loggedIn ? 'session' : (settings.iaAccessKey ? 'api keys' : 'anon');
                 var attempt = 0;
@@ -821,27 +827,63 @@
         });
     }
 
-    // opens an archive.today submission tab for a url.
-    // used as a last-resort fallback when wayback is blocked by ao3 at the
-    // ip/network level. archive.today uses different crawling infrastructure
-    // and is generally not blocked by ao3 the same way wayback is.
-    function saveViaArchiveToday(url) {
-        return new Promise(function (resolve, reject) {
-            var baseUrl = url.split('?')[0];
-            var atUrl = 'https://archive.ph/submit/?url=' + encodeURIComponent(baseUrl);
-            showBanner('Wayback blocked by AO3 -- trying archive.today as fallback' +
-                (IS_TOUCH ? ' (check new tab)' : '') + '...', 'info', 30000);
-            console.log('[AO3→Wayback] trying archive.today:', atUrl);
-            try {
-                GM_openInTab(atUrl, { active: IS_TOUCH, insert: true });
-                setTimeout(function () {
-                    resolve({ url: baseUrl, method: 'archive.today' });
-                }, 3000);
-            } catch (e) {
-                logError('archive.today', String(e));
-                reject(new Error('archive.today fallback failed: ' + String(e)));
-            }
+    // archive.today mirror list -- tried in order until one responds without a 5xx.
+    // archive.ph, archive.today, archive.is, archive.md all front the same service
+    // but have independent server pools that may be up when others are down.
+    var ARCHIVE_TODAY_MIRRORS = [
+        'https://archive.ph',
+        'https://archive.today',
+        'https://archive.is',
+        'https://archive.md',
+    ];
+
+    // pings a mirror with a HEAD request and resolves with true if it's up (< 500).
+    function pingArchiveMirror(mirror) {
+        return new Promise(function (resolve) {
+            GM_xmlhttpRequest({
+                method: 'HEAD',
+                url: mirror + '/',
+                timeout: 8000,
+                onload: function (r) { resolve(r.status < 500); },
+                onerror: function () { resolve(false); },
+                ontimeout: function () { resolve(false); },
+            });
         });
+    }
+
+    // tries each archive.today mirror in turn and opens a tab on the first one
+    // that responds without a server error. resolves even if the tab eventually
+    // shows a captcha (archive.today is a third-party service).
+    function saveViaArchiveToday(url) {
+        var baseUrl = url.split('?')[0];
+        showBanner('Wayback blocked -- finding available archive.today mirror...', 'info', 60000);
+
+        function tryMirror(index) {
+            if (index >= ARCHIVE_TODAY_MIRRORS.length) {
+                return Promise.reject(new Error('all archive.today mirrors returned errors'));
+            }
+            var mirror = ARCHIVE_TODAY_MIRRORS[index];
+            console.log('[AO3→Wayback] checking archive.today mirror:', mirror);
+            return pingArchiveMirror(mirror).then(function (up) {
+                if (!up) {
+                    console.log('[AO3→Wayback] mirror down, trying next:', mirror);
+                    return tryMirror(index + 1);
+                }
+                var atUrl = mirror + '/submit/?url=' + encodeURIComponent(baseUrl);
+                console.log('[AO3→Wayback] opening archive.today tab:', atUrl);
+                showBanner('Wayback blocked -- opening archive.today (' + mirror.replace('https://', '') + ')' +
+                    (IS_TOUCH ? ' (check new tab)' : '') + '...', 'info', 30000);
+                try {
+                    GM_openInTab(atUrl, { active: IS_TOUCH, insert: true });
+                    return { url: baseUrl, method: 'archive.today (' + mirror + ')' };
+                } catch (e) {
+                    logError('archive.today', String(e));
+                    return tryMirror(index + 1);
+                }
+            });
+        }
+
+        return tryMirror(0);
     }
 
     // always awaits getCachedIaStatus() before deciding which method to use.

@@ -891,6 +891,12 @@
     // the bookmark form before the 10s pre-warm has completed -- the cache is
     // still null, useSPN2 evaluates to false, and the tab method is used instead
     // of spn2, which opens a wayback tab that shows "server does not respond".
+    // always awaits getCachedIaStatus before routing.
+    // if spn2 auth is available (session or api keys): try spn2 first, fall back
+    // to archive.today if ao3 blocks wayback's crawler.
+    // if no spn2 auth: skip wayback entirely and go straight to archive.today.
+    // wayback's crawler is blocked by ao3 regardless of submission method (tab or
+    // api), so opening a wayback tab just shows a visible error page with no benefit.
     function saveToWayback(url) {
         return getCachedIaStatus().then(function (iaStatus) {
             var useSPN2 = !!(settings.iaAccessKey && settings.iaSecretKey) || iaStatus.loggedIn;
@@ -906,13 +912,14 @@
                 });
             }
 
-            console.log('[AO3→Wayback] saveToWayback -> tab method for:', url);
-            return saveViaTab(url).then(null, function () {
-                console.log('[AO3→Wayback] tab method failed, falling back to archive.today');
-                return saveViaArchiveToday(url);
-            });
+            // no spn2 auth -- wayback's crawler is blocked by ao3 for all fics
+            // so the tab method produces the same error. skip directly to archive.today.
+            console.log('[AO3→Wayback] no spn2 auth, going directly to archive.today');
+            showBanner('No IA session detected -- saving via archive.today directly...', 'info', 30000);
+            return saveViaArchiveToday(url);
         });
     }
+
 
 
 

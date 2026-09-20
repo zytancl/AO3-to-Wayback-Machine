@@ -5,7 +5,7 @@ A userscript that automatically saves AO3 fics to the [Internet Archive Wayback 
 Expect random updates because the auto-archive function may randomly stop working.
 
 **PLS READ BEFORE INSTALLING:**
-lately, this script is unable to work properly as intended. *ao3 is actively blocking all of wayback machine's crawler eps at the network level and this is something that i'm currently unable to bypass.* as of now, until i cross out this text, i suggest that you don't use/uninstall this script yet!!!
+lately, this script is unable to work properly as intended. *ao3 is actively blocking all of wayback machine's crawler eps at the network level and this is something that i'm currently unable to bypass.* as of now, until I can finally fix this and get this to work properly, i'm removing the file and download link for this. if you have already installed this, i also suggest that you disable/uninstall this for now!
 
 ## Features
 
